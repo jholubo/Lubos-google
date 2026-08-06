@@ -1,0 +1,6 @@
+{
+  "name": "Lubo's Tiramisú",
+  "description": "Sistema de Gestión Logística para Lubo's Tiramisú",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

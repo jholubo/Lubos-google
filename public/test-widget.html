@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Test Lubos Widget</title>
+<style>
+  body { background: #FBF7E3; font-family: 'Inter', sans-serif; padding: 30px; }
+  .card { display: inline-block; width: 220px; margin: 12px; padding: 18px; background: white; border-radius: 16px; text-align: center; transition: opacity 0.35s ease; }
+  .card img { width: 100%; border-radius: 12px; height: 120px; background: #ccc; }
+  h3 { margin: 12px 0 4px; color: #501122; }
+  .price { color: #8C7862; margin: 0 0 10px; }
+  [data-lubos] { display: inline-block; padding: 6px 12px; background: #F3EBE0; border-radius: 999px; font-weight: 700; color: #501122; font-size: 14px; min-height: 24px; }
+  [data-lubos]:empty { display: none; }
+</style>
+</head>
+<body>
+
+<h2>Test - Solo texto + dimming por clase CSS</h2>
+
+<div class="card clasico">
+  <img src="" alt="Clasico">
+  <h3>Clasico</h3>
+  <p class="price">$10.00</p>
+  <span data-lubos="Clasico"></span>
+</div>
+
+<div class="card cacao-denso">
+  <img src="" alt="Cacao Denso">
+  <h3>Cacao Denso</h3>
+  <p class="price">$10.00</p>
+  <span data-lubos="Cacao Denso"></span>
+</div>
+
+<div class="card pistacho-cream">
+  <img src="" alt="Pistacho Cream">
+  <h3>Pistacho Cream</h3>
+  <p class="price">$12.00</p>
+  <span data-lubos="Pistacho Cream"></span>
+</div>
+
+<script src="/lubos-stock.js"></script>
+</body>
+</html>

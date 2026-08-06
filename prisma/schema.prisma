@@ -1,0 +1,151 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id              String    @id @default(uuid())
+  username        String    @unique
+  password_hash   String
+  name            String
+  role            String    @default("vendedor")
+  photo_data_url  String?
+  location_lat    Float?
+  location_lng    Float?
+  location_updated_at DateTime?
+  created_at      DateTime  @default(now())
+}
+
+model Customer {
+  id          String   @id @default(uuid())
+  name        String
+  phone       String
+  gender      String?
+  order_count Int      @default(0)
+  created_at  DateTime @default(now())
+}
+
+model Flavor {
+  id              String   @id @default(uuid())
+  name            String
+  price_usd       Float
+  available       Boolean  @default(true)
+  stock           Int      @default(0)
+  stock_unlimited Boolean  @default(false)
+  image           String?
+  sort_order      Int?
+  created_at      DateTime @default(now())
+}
+
+model StockMovement {
+  id          String   @id @default(uuid())
+  flavor_id   String
+  flavor_name String
+  delta       Int
+  new_stock   Int
+  description String
+  user_id     String
+  user_name   String
+  created_at  DateTime @default(now())
+}
+
+model Order {
+  id               String      @id @default(uuid())
+  order_number     String
+  customer_id      String?
+  customer_name    String
+  customer_phone   String?
+  customer_gender  String?
+  order_type       String      @default("delivery")
+  delivery_address String
+  lat              Float?
+  lng              Float?
+  delivery_id      String?
+  delivery_name    String?
+  delivery_fee     Float       @default(0)
+  status           String      @default("pendiente")
+  is_quote         Boolean     @default(false)
+  quote_description String?
+  scheduled_for    String?
+  wait_for_notice  Boolean     @default(false)
+  total_usd        Float
+  items_total      Float
+  notes            String?
+  velitas          Boolean     @default(false)
+  receiver_name    String?
+  receiver_phone   String?
+  prepared         Boolean     @default(false)
+  prepared_at      DateTime?
+  prepared_by_name String?
+  created_by       String?
+  created_by_name  String?
+  paid_at          DateTime?
+  delivered_at     DateTime?
+  route_polyline   String?
+  route_origin_lat Float?
+  route_origin_lng Float?
+  created_at       DateTime    @default(now())
+  updated_at       DateTime    @updatedAt
+  items            OrderItem[]
+}
+
+model OrderItem {
+  id          String @id @default(uuid())
+  order_id    String
+  order       Order  @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  flavor_id   String
+  flavor_name String
+  quantity    Int
+  price_usd   Float
+}
+
+model Notification {
+  id         String   @id @default(uuid())
+  user_id    String
+  type       String
+  order_id   String?
+  message    String
+  read       Boolean  @default(false)
+  created_at DateTime @default(now())
+}
+
+model DeliveryZone {
+  id                String   @id @default(uuid())
+  name              String
+  polygon           Json
+  delivery_cost_usd Float
+  color             String   @default("#501122")
+  created_at        DateTime @default(now())
+}
+
+model AppSettings {
+  key                 String   @id @default("app_settings")
+  exchange_rate_ves   Float?   @default(36.5)
+  delivery_driver_pct Float?   @default(85.0)
+  central_point_url   String?
+  central_point_lat   Float?
+  central_point_lng   Float?
+  updated_at          DateTime @updatedAt
+}
+
+model WidgetSettings {
+  key         String   @id @default("widget_settings")
+  msg_stock_1 String?  @default("Quedan 1")
+  msg_stock_2 String?  @default("Quedan 2")
+  msg_stock_3 String?  @default("Quedan 3")
+  msg_stock_4 String?  @default("Quedan 4")
+  msg_stock_5 String?  @default("Quedan 5")
+  msg_out     String?  @default("Agotados")
+  updated_at  DateTime @updatedAt
+}
+
+model PushSubscription {
+  id           String @id @default(uuid())
+  user_id      String
+  endpoint     String @unique
+  subscription Json
+}

@@ -1,0 +1,62 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: 'Inter', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.font-heading {
+  font-family: 'Outfit', sans-serif;
+  font-weight: 700;
+}
+
+@layer base {
+  :root {
+    --background: 35 42% 96%;
+    --foreground: 344 65% 19%;
+    --card: 0 0% 100%;
+    --card-foreground: 344 65% 19%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 344 65% 19%;
+    --primary: 344 65% 19%;
+    --primary-foreground: 35 42% 96%;
+    --secondary: 30 53% 64%;
+    --secondary-foreground: 344 65% 19%;
+    --muted: 35 20% 91%;
+    --muted-foreground: 344 20% 45%;
+    --accent: 35 20% 91%;
+    --accent-foreground: 344 65% 19%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 30 22% 85%;
+    --input: 30 22% 85%;
+    --ring: 344 65% 19%;
+    --chart-1: 344 50% 35%;
+    --chart-2: 30 58% 52%;
+    --chart-3: 40 37% 40%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 27 87% 67%;
+    --radius: 0.625rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer base {
+  [data-debug-wrapper="true"] {
+    display: contents !important;
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "theme": "Light",
+  "archetype": "Archetype 1 (Organic & Earthy) blended with modern bento structures.",
+  "global_design_philosophy": "A complete aesthetic overhaul to a 'Modern Bento' style focusing on organic warmth and high scanability for mobile delivery workers. The brand's deep wine (#501122) is the anchor, paired with a warm cream (#FBF7F0) background. We heavily utilize large rounded corners (3xl) to create soft, modular bento cards that pop off the cream background using subtle borders rather than heavy drop shadows. The layout relies on generous spacing, asymmetrical grids on desktop, and vertical bento stacks on mobile. ALL existing functionality remains intact.",
+  "colors": {
+    "background": "#FBF7F0",
+    "foreground": "#1F1517",
+    "primary": "#501122",
+    "primary_foreground": "#FFFFFF",
+    "card": "#FFFFFF",
+    "card_foreground": "#1F1517",
+    "secondary": "#F3EBE0",
+    "secondary_foreground": "#501122",
+    "muted": "#F0E4D8",
+    "muted_foreground": "#78686C",
+    "border": "rgba(80, 17, 34, 0.08)",
+    "accent_success": "#3F634A",
+    "accent_warning": "#C27A29"
+  },
+  "typography": {
+    "font_family_headings": "Outfit, sans-serif",
+    "font_family_body": "Inter, sans-serif",
+    "h1": "text-4xl md:text-5xl font-bold tracking-tight text-[#501122]",
+    "h2": "text-2xl md:text-3xl font-semibold tracking-tight",
+    "h3": "text-xl font-semibold",
+    "body": "text-base text-[#1F1517]",
+    "label": "text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]",
+    "instructions": "Import Google fonts if not present. Use Outfit for all Dashboard Page Titles, Bento Card Titles, and large KPI numbers. Use Inter for tables, body text, and inputs to maintain high data legibility."
+  },
+  "spacing_and_layout": {
+    "page_padding": "p-4 md:p-6 lg:p-8",
+    "bento_grid": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6",
+    "card_padding": "p-5 md:p-6 md:p-8",
+    "border_radius_container": "rounded-[1.5rem] lg:rounded-[2rem]",
+    "border_radius_element": "rounded-xl lg:rounded-2xl",
+    "border_radius_pill": "rounded-full"
+  },
+  "components_strategy": {
+    "cards": "Bento Cards: bg-white with a 1px solid border of border-[#501122]/10 and a very subtle ambient shadow (shadow-[0_8px_30px_rgba(80,17,34,0.03)]). This creates a crisp, modern bento look that separates gently from the warm cream background.",
+    "buttons_primary": "bg-[#501122] text-white rounded-full h-12 md:h-14 font-semibold hover:bg-[#3D0C19] transition-transform hover:-translate-y-0.5 shadow-md px-6",
+    "buttons_secondary": "bg-[#F3EBE0] text-[#501122] rounded-full h-12 md:h-14 font-medium hover:bg-[#EBDDD0] transition-transform px-6",
+    "action_buttons_delivery": "For WhatsApp/Maps actions, use massive touch targets (h-14 rounded-2xl) with high contrast colors. Ensure they stretch full width on mobile.",
+    "inputs": "bg-white border border-[#501122]/15 rounded-2xl h-12 px-4 focus:ring-2 focus:ring-[#501122]/20 outline-none transition-all",
+    "tabs": "Pill-style tabs inside a muted container (bg-[#F0E4D8] p-1.5 rounded-full). Active tab: bg-white text-[#501122] rounded-full shadow-sm. Inactive: text-[#78686C] hover:text-[#501122].",
+    "badges": "rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wider. Pending: bg-[#C27A29]/15 text-[#C27A29]. Completed: bg-[#3F634A]/15 text-[#3F634A].",
+    "bottom_navigation": "Floating glassmorphic pill on mobile bottom: fixed bottom-4 left-4 right-4 bg-white/90 backdrop-blur-xl border border-[#501122]/10 shadow-xl rounded-[2rem] flex justify-around p-2 z-50."
+  },
+  "motion_and_interactions": {
+    "hover_states": "Cards subtly elevate on hover (-translate-y-1) on desktop. Buttons scale down slightly on active (active:scale-95).",
+    "transitions": "transition-all duration-300 ease-out",
+    "page_load": "Implement staggered fade-in + slight slide-up for bento grid items if framer-motion is used."
+  },
+  "iconography_and_assets": {
+    "library": "lucide-react (already installed)",
+    "style": "Use stroke-width 2, size 20-24px, matching text color.",
+    "images": [
+      {
+        "category": "login_background",
+        "description": "Warm, aesthetic tiramisu flatlay to set the mood on the login screen.",
+        "url": "https://images.unsplash.com/photo-1605487821592-1d9b47fd9957?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2ODh8MHwxfHNlYXJjaHwyfHx0aXJhbWlzdSUyMGRlc3NlcnQlMjBmbGF0bGF5fGVufDB8fHx8MTc3ODQ2NDkwN3ww&ixlib=rb-4.1.0&q=85"
+      },
+      {
+        "category": "empty_state",
+        "description": "Secondary sweet dessert aesthetic for empty states (e.g. no active orders).",
+        "url": "https://images.unsplash.com/photo-1568627175551-88ba5b80c0c3?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2ODh8MHwxfHNlYXJjaHwxfHx0aXJhbWlzdSUyMGRlc3NlcnQlMjBmbGF0bGF5fGVufDB8fHx8MTc3ODQ2NDkwN3ww&ixlib=rb-4.1.0&q=85"
+      }
+    ]
+  },
+  "page_specific_instructions": {
+    "LoginPage": "Split screen on desktop (Left: Bento style login card on cream bg, Right: Tiramisu image). On mobile, cream bg with a highly rounded white bento card.",
+    "VendorDashboard": "Bento layout. Left column (or top on mobile): New order entry in a large bento card. Right column (or bottom): Active orders feed. Use large numeric keypads or plus/minus buttons with rounded-full for flavor quantity.",
+    "DeliveryDashboard": "Mobile-optimized. Top bento row: Pending deliveries count + Revenue today. Vertical stack of highly rounded order cards. Each card must have clearly separated sections for Customer, Address, and Action Buttons (WhatsApp/Map side-by-side pills).",
+    "AdminDashboard": "Control Room Grid. Top row: 4 stat bento cards (Resumen). Next section: Bar chart in a massive bento card. Tables (Pedidos/Clientes) inside wide bento cards with no internal borders—let the data breathe with generous padding.",
+    "Layout_Header": "Sticky, glassmorphic (bg-[#FBF7F0]/80 backdrop-blur-xl). Remove hard shadows, use a 1px bottom border (border-[#501122]/5). Ensure role badges (e.g., 'Repartidor') look like premium pills."
+  },
+  "testing": {
+    "attributes": "All interactive elements MUST have data-testid attributes (e.g., data-testid='login-button', data-testid='delivery-whatsapp-btn')."
+  },
+  "technical_constraints": "Use .js and .jsx for all React components. Do not output .tsx files. Use Tailwind classes heavily to compose the bento elements directly."
+}
