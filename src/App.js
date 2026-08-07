@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { Toaster } from '@/components/ui/sonner';
@@ -7,6 +8,7 @@ import VendorDashboard from '@/pages/VendorDashboard';
 import DeliveryDashboard from '@/pages/DeliveryDashboard';
 import AdminDashboard from '@/pages/AdminDashboard';
 import MapView from '@/pages/MapView';
+import { initDataSync } from '@/lib/dataSync';
 import '@/App.css';
 
 const roleRoutes = { admin: '/admin', vendedor: '/vendor', delivery: '/delivery' };
@@ -31,6 +33,10 @@ function RoleRedirect() {
 }
 
 function App() {
+  useEffect(() => {
+    initDataSync();
+  }, []);
+
   return (
     <AuthProvider>
       <BrowserRouter>

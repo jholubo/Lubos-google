@@ -53,6 +53,45 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── REAL-TIME EVENT STREAM (SSE) ──
+const sseClients = new Set<Response>();
+
+export function broadcastEvent(event: string, payload: any = {}) {
+  const dataString = `data: ${JSON.stringify({ event, payload, timestamp: Date.now() })}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(dataString);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
+
+app.get('/api/events', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  res.write(`data: ${JSON.stringify({ event: 'connected', timestamp: Date.now() })}\n\n`);
+  sseClients.add(res);
+
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
+});
+
+setInterval(() => {
+  const ping = `data: ${JSON.stringify({ event: 'ping', timestamp: Date.now() })}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(ping);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}, 20000);
+
 async function getDeliveryDriverPct(): Promise<number> {
   try {
     const s = await prisma.appSettings.findUnique({ where: { key: 'app_settings' } });
@@ -68,6 +107,25 @@ interface AuthRequest extends Request {
 }
 
 // ── 1. AUTH ROUTES ──
+
+app.get('/api/public/team', async (req: Request, res: Response) => {
+  try {
+    const users = await prisma.user.findMany({
+      orderBy: { name: 'asc' },
+      select: {
+        id: true,
+        username: true,
+        name: true,
+        role: true,
+        photo_data_url: true,
+      },
+    });
+    res.json(users);
+  } catch (err: any) {
+    console.error('Error in public team route:', err);
+    res.status(500).json({ detail: 'Error al obtener miembros del equipo' });
+  }
+});
 
 app.post('/api/auth/login', async (req: Request, res: Response) => {
   try {
@@ -677,6 +735,7 @@ app.post('/api/orders/:order_id/take', requireRoles('delivery'), async (req: Aut
         delivery_name: user.name,
       },
     });
+    broadcastEvent('orders_changed', { order_id, action: 'take' });
     res.json({ message: 'Pedido tomado', order_id });
   } catch (err: any) {
     console.error('Error taking order:', err);
@@ -704,6 +763,7 @@ app.delete('/api/quotes/:quote_id', requireRoles('admin', 'vendedor'), async (re
     await prisma.order.deleteMany({
       where: { id: quote_id, is_quote: true },
     });
+    broadcastEvent('orders_changed', { quote_id, action: 'delete_quote' });
     res.json({ message: 'Cotización eliminada' });
   } catch (err: any) {
     console.error('Error deleting quote:', err);
@@ -771,6 +831,10 @@ app.post('/api/quotes/:quote_id/convert', requireRoles('admin', 'vendedor'), asy
         },
       });
     }
+
+    broadcastEvent('orders_changed', { order_id: quote_id, action: 'convert_quote' });
+    broadcastEvent('notifications_changed');
+    broadcastEvent('flavors_changed');
 
     res.json(formatOrder(updatedQuote));
   } catch (err: any) {
@@ -900,6 +964,10 @@ app.post('/api/orders', requireRoles('admin', 'vendedor'), async (req: AuthReque
       }
     }
 
+    broadcastEvent('orders_changed', { order_id: orderId, action: 'create' });
+    broadcastEvent('notifications_changed');
+    if (!data.is_quote) broadcastEvent('flavors_changed');
+
     res.json(formatOrder(newOrder));
   } catch (err: any) {
     console.error('Error creating order:', err);
@@ -968,6 +1036,7 @@ app.patch('/api/orders/:order_id', requireRoles('admin', 'vendedor'), async (req
       include: { items: true },
     });
 
+    broadcastEvent('orders_changed', { order_id, action: 'update' });
     res.json(formatOrder(updated));
   } catch (err: any) {
     console.error('Error updating order:', err);
@@ -989,6 +1058,7 @@ app.patch('/api/orders/:order_id/toggle-wait-notice', requireRoles('admin', 'ven
       data: { wait_for_notice: nextState },
       include: { items: true },
     });
+    broadcastEvent('orders_changed', { order_id, action: 'toggle_wait' });
     res.json(formatOrder(updated));
   } catch (err: any) {
     console.error('Error toggling wait notice:', err);
@@ -1018,6 +1088,7 @@ app.patch('/api/orders/:order_id/prepared', requireRoles('admin', 'vendedor'), a
       include: { items: true },
     });
 
+    broadcastEvent('orders_changed', { order_id, action: 'prepared' });
     res.json(formatOrder(updated));
   } catch (err: any) {
     console.error('Error updating prepared status:', err);
@@ -1068,6 +1139,8 @@ app.post('/api/orders/:order_id/assign-delivery', requireRoles('admin', 'vendedo
       },
     });
 
+    broadcastEvent('orders_changed', { order_id, action: 'assign' });
+    broadcastEvent('notifications_changed');
     res.json({ ok: true });
   } catch (err: any) {
     console.error('Error assigning delivery:', err);
@@ -1113,6 +1186,8 @@ app.post('/api/orders/:order_id/unassign-delivery', requireRoles('admin', 'vende
       });
     }
 
+    broadcastEvent('orders_changed', { order_id, action: 'unassign' });
+    broadcastEvent('notifications_changed');
     res.json({ message: 'Pedido liberado a Disponibles', order_id });
   } catch (err: any) {
     console.error('Error unassigning delivery:', err);
@@ -1146,6 +1221,8 @@ app.delete('/api/orders/:order_id', requireRoles('admin', 'vendedor'), async (re
     }
 
     await prisma.order.delete({ where: { id: order_id } });
+    broadcastEvent('orders_changed', { order_id, action: 'delete' });
+    broadcastEvent('flavors_changed');
     res.json({ message: 'Pedido eliminado', order_id });
   } catch (err: any) {
     console.error('Error deleting order:', err);
@@ -1218,6 +1295,8 @@ app.patch('/api/orders/:order_id/status', authMiddleware, async (req: AuthReques
       data: updateData,
     });
 
+    broadcastEvent('orders_changed', { order_id, action: 'status_change', status: newStatus });
+    broadcastEvent('notifications_changed');
     res.json({ message: 'Estado actualizado', status: newStatus });
   } catch (err: any) {
     console.error('Error updating order status:', err);
@@ -2077,6 +2156,17 @@ app.post('/api/push/unsubscribe', authMiddleware, async (req: AuthRequest, res: 
 // ── 10. VITE / STATIC SERVING ──
 
 async function startServer() {
+  // Ensure all existing user passwords are set to '1234'
+  try {
+    const defaultHash = hashPassword('1234');
+    await prisma.user.updateMany({
+      data: { password_hash: defaultHash },
+    });
+    console.log('✅ Updated all user passwords to 1234');
+  } catch (err) {
+    console.error('Error updating passwords to 1234:', err);
+  }
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

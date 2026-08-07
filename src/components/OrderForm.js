@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
 import api, { formatUSD, formatVES } from '@/lib/api';
+import { getLocalCache, setLocalCache } from '@/lib/cache';
+import { notifyLocalChange } from '@/lib/dataSync';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -163,6 +165,16 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
   const [customerSearch, setCustomerSearch] = useState('');
 
   const loadData = useCallback(async () => {
+    // Instant cache population (0ms render time)
+    const cFlavors = getLocalCache('flavors');
+    if (cFlavors) setFlavors(cFlavors.filter(x => x.available));
+    const cCust = getLocalCache('customers');
+    if (cCust) setCustomers(cCust);
+    const cUsers = getLocalCache('users');
+    if (cUsers) setDeliveryUsers(cUsers.filter(x => x.role === 'delivery'));
+    const cSettings = getLocalCache('settings');
+    if (cSettings?.exchange_rate_ves) setBcvRate(cSettings.exchange_rate_ves);
+
     try {
       const [c, f, u, s] = await Promise.all([
         api.get('/customers', { params: { limit: 25 } }),
@@ -171,9 +183,13 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
         api.get('/settings'),
       ]);
       setCustomers(c.data);
+      setLocalCache('customers', c.data);
       setFlavors(f.data.filter(x => x.available));
+      setLocalCache('flavors', f.data);
       setDeliveryUsers(u.data.filter(x => x.role === 'delivery'));
+      setLocalCache('users', u.data);
       if (s.data?.exchange_rate_ves) setBcvRate(s.data.exchange_rate_ves);
+      setLocalCache('settings', s.data);
       if (typeof s.data?.central_point_lat === 'number' && typeof s.data?.central_point_lng === 'number') {
         setCentralPoint({ lat: s.data.central_point_lat, lng: s.data.central_point_lng });
       }
@@ -346,6 +362,9 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
         try { await api.delete(`/quotes/${initialQuote.id}`); }
         catch (e) { console.warn('No se pudo eliminar la cotizacion original:', e?.message || e); }
       }
+
+      // Dispara evento instantaneo en el cliente y para todas las demas pestanas/dispositivos
+      notifyLocalChange('orders_changed');
       // Sonido de caja registradora al crear un pedido real (no cotizacion) —
       // el creador lo escucha inmediatamente, resto de admins/vendors via polling.
       if (!isQuote) {

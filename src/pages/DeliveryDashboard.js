@@ -3,12 +3,15 @@ import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { useAuth } from '@/contexts/AuthContext';
 import api, { formatUSD, formatVES } from '@/lib/api';
+import { getLocalCache, setLocalCache } from '@/lib/cache';
+import { notifyLocalChange } from '@/lib/dataSync';
 import { useNotifications } from '@/hooks/useNotifications';
 import usePushSubscription from '@/hooks/usePushSubscription';
 import DeliveryMap from '@/components/DeliveryMap';
+import DeliveryNavigationMap from '@/components/DeliveryNavigationMap';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { MessageCircle, MapPin, Check, Truck, Package, BarChart3, Undo2, DollarSign, CheckCircle2, Clock, Calendar, TrendingUp, Phone, ChevronDown, ChevronUp, ShoppingBag, Cake, Hourglass, LogOut, Volume2, VolumeX } from 'lucide-react';
+import { MessageCircle, MapPin, Check, Truck, Package, BarChart3, Undo2, DollarSign, CheckCircle2, Clock, Calendar, TrendingUp, Phone, ChevronDown, ChevronUp, ShoppingBag, Cake, Hourglass, LogOut, Volume2, VolumeX, Menu, X, Navigation, ExternalLink } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 
 const statusColors = {
@@ -42,6 +45,7 @@ export default function DeliveryDashboard() {
   const [orders, setOrders] = useState([]);
   const [availableOrders, setAvailableOrders] = useState([]);
   const [expandedOrderId, setExpandedOrderId] = useState(null);
+  const [activeRouteOrder, setActiveRouteOrder] = useState(null);
   const [settings, setSettings] = useState({ exchange_rate_ves: 36.5 });
   const [deliveryStats, setDeliveryStats] = useState(null);
   const [dataPeriod, setDataPeriod] = useState('week');
@@ -56,20 +60,29 @@ export default function DeliveryDashboard() {
   };
 
   const loadFast = useCallback(async () => {
-    // Delivery: solo lo "vivo" (mis pedidos + disponibles + stats). Settings no cambia en polling.
+    // Instant cache read
+    const cMyOrders = getLocalCache('delivery_my_orders');
+    if (cMyOrders) setOrders(cMyOrders);
+    const cAvailOrders = getLocalCache('delivery_avail_orders');
+    if (cAvailOrders) setAvailableOrders(cAvailOrders);
+
     try {
       const [o, av] = await Promise.all([
         api.get('/orders'),
         api.get('/orders/available').catch(() => ({ data: [] })),
       ]);
-      setOrders(o.data); setAvailableOrders(av.data);
+      setOrders(o.data); setLocalCache('delivery_my_orders', o.data);
+      setAvailableOrders(av.data); setLocalCache('delivery_avail_orders', av.data);
     } catch (e) { console.warn('[Delivery] fast fetch failed:', e?.message || e); }
   }, []);
 
   const loadSettings = useCallback(async () => {
+    const cSettings = getLocalCache('settings');
+    if (cSettings) setSettings(cSettings);
     try {
       const { data } = await api.get('/settings');
       setSettings(data);
+      setLocalCache('settings', data);
     } catch (e) { console.warn('[Delivery] settings fetch failed:', e?.message || e); }
   }, []);
 
@@ -157,18 +170,29 @@ export default function DeliveryDashboard() {
   }, []);
 
   const updateStatus = async (orderId, status) => {
+    const prevOrder = (Array.isArray(orders) ? orders : []).find(o => o.id === orderId);
+    
+    // 0ms Optimistic UI update
+    setOrders(prev => (Array.isArray(prev) ? prev : []).map(o => o.id === orderId ? { ...o, status, delivered_at: status === 'entregado' ? new Date().toISOString() : o.delivered_at } : o));
+    notifyLocalChange('orders_changed');
+    toast.success(status === 'entregado' ? 'Pedido entregado!' : status === 'pendiente' ? 'Pedido revertido' : 'En camino!');
+
     try {
       await api.patch(`/orders/${orderId}/status`, { status });
-      toast.success(status === 'entregado' ? 'Pedido entregado!' : status === 'pendiente' ? 'Pedido revertido' : 'En camino!');
-      loadOrders();
-      loadDeliveryStats();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+    } catch (err) {
+      if (prevOrder) setOrders(prev => (Array.isArray(prev) ? prev : []).map(o => o.id === orderId ? prevOrder : o));
+      toast.error(err.response?.data?.detail || 'Error actualizando estado');
+    }
   };
 
   const whatsappMessage = encodeURIComponent("Listo, ya estoy aca en la ubicacion");
   const rate = settings.exchange_rate_ves || 36.5;
   
   const safeOrders = Array.isArray(orders) ? orders : [];
+  const currentRouteOrder = useMemo(() => {
+    if (!activeRouteOrder) return null;
+    return safeOrders.find(o => o.id === activeRouteOrder.id) || activeRouteOrder;
+  }, [activeRouteOrder, safeOrders]);
   const activeOrders = safeOrders.filter(o => o.status !== 'entregado' && o.status !== 'cancelado');
   // Expone si el delivery esta LIBRE (sin pedidos activos en Mis Pedidos) para que
   // useNotifications decida que sonido tocar cuando llega uno disponible.
@@ -268,12 +292,24 @@ export default function DeliveryDashboard() {
 
   const releaseOrder = async (orderId) => {
     if (!window.confirm('Devolver este pedido a Disponibles? Otro repartidor podra tomarlo.')) return;
+    const targetOrder = (Array.isArray(orders) ? orders : []).find(o => o.id === orderId);
+
+    // 0ms Optimistic UI update: move from orders -> availableOrders
+    setOrders(prev => (Array.isArray(prev) ? prev : []).filter(o => o.id !== orderId));
+    if (targetOrder) {
+      setAvailableOrders(prev => [...(Array.isArray(prev) ? prev : []), { ...targetOrder, delivery_id: null, delivery_name: null }]);
+    }
+    notifyLocalChange('orders_changed');
+    toast.success('Pedido devuelto a Disponibles');
+
     try {
       await api.post(`/orders/${orderId}/unassign-delivery`);
-      toast.success('Pedido devuelto a Disponibles');
-      loadOrders();
     } catch (e) {
-      toast.error(e?.response?.data?.detail || 'Error');
+      if (targetOrder) {
+        setOrders(prev => [...(Array.isArray(prev) ? prev : []), targetOrder]);
+        setAvailableOrders(prev => (Array.isArray(prev) ? prev : []).filter(o => o.id !== orderId));
+      }
+      toast.error(e?.response?.data?.detail || 'Error al liberar pedido');
     }
   };
 
@@ -282,11 +318,18 @@ export default function DeliveryDashboard() {
       toast.error('Este pedido tiene "esperar aviso" activo y no se puede tomar aún');
       return;
     }
+
+    // 0ms Optimistic UI update: move from availableOrders -> orders
+    setAvailableOrders(prev => (Array.isArray(prev) ? prev : []).filter(o => o.id !== order.id));
+    setOrders(prev => [...(Array.isArray(prev) ? prev : []), { ...order, delivery_id: user?.id, delivery_name: user?.name || 'Delivery' }]);
+    notifyLocalChange('orders_changed');
+    toast.success('Pedido tomado. Toca "Salir a Entregar" para avisarle al cliente.');
+
     try {
       await api.post(`/orders/${order.id}/take`);
-      toast.success('Pedido tomado. Toca "Salir a Entregar" para avisarle al cliente.');
-      loadOrders();
     } catch (e) {
+      setOrders(prev => (Array.isArray(prev) ? prev : []).filter(o => o.id !== order.id));
+      setAvailableOrders(prev => [...(Array.isArray(prev) ? prev : []), order]);
       toast.error(e?.response?.data?.detail || 'Error tomando pedido');
     }
   };
@@ -310,7 +353,45 @@ export default function DeliveryDashboard() {
   };
 
   return (
-    <div className="space-y-5 pb-24 md:pb-6">
+    <div className="space-y-3 md:space-y-5 pb-20 md:pb-6">
+      {/* Mobile Header Bar (Logo, Repartidor Info & Icon Actions: Data & Logout) */}
+      <div className="md:hidden flex items-center justify-between gap-2 bg-white rounded-2xl border border-[#501122]/10 p-2.5 px-4 shadow-sm">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <img src="/logo.svg" alt="Lubo's" className="h-6 w-auto shrink-0" />
+          <div className="h-4 w-px bg-[#501122]/15 shrink-0" />
+          <div className="min-w-0">
+            <p className="font-heading text-xs text-[#501122] font-bold leading-tight truncate">{userName}</p>
+            <p className="text-[9px] font-semibold uppercase tracking-wider text-[#78686C]">Repartidor</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 shrink-0">
+          {/* Data / Stats Icon Button */}
+          <button
+            onClick={() => setActiveSection('data')}
+            data-testid="mobile-data-btn"
+            title="Estadísticas y Data"
+            className={`p-2.5 rounded-xl transition-all active:scale-95 ${
+              activeSection === 'data'
+                ? 'bg-[#501122] text-white shadow-sm'
+                : 'bg-[#501122]/5 text-[#501122] hover:bg-[#501122]/10'
+            }`}
+          >
+            <BarChart3 className="h-5 w-5" />
+          </button>
+
+          {/* Logout Icon Button */}
+          <button
+            onClick={handleLogout}
+            data-testid="mobile-delivery-logout-btn"
+            title="Cerrar sesión"
+            className="p-2.5 rounded-xl bg-red-50 text-red-600 hover:bg-red-100 transition-colors active:scale-95"
+          >
+            <LogOut className="h-5 w-5" />
+          </button>
+        </div>
+      </div>
+
       {/* Desktop Header Bar (Logo, Nav Tabs & Logout) */}
       <div className="hidden md:flex items-center justify-between gap-4 bg-white rounded-[1.5rem] border border-[#501122]/10 p-3 px-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)]">
         <div className="flex items-center gap-3">
@@ -335,11 +416,6 @@ export default function DeliveryDashboard() {
 
         {/* Right Action Bar */}
         <div className="flex items-center gap-2">
-          {settings.exchange_rate_ves && (
-            <div className="bg-[#3F634A]/10 border border-[#3F634A]/20 px-3 py-1.5 rounded-full text-[11px] font-bold text-[#3F634A]">
-              BCV: {settings.exchange_rate_ves.toFixed(2)} Bs
-            </div>
-          )}
           <button
             onClick={handleLogout}
             data-testid="desktop-delivery-logout-btn"
@@ -354,7 +430,7 @@ export default function DeliveryDashboard() {
 
       {/* DISPONIBLES - simplified: name + location + take button */}
       {activeSection === 'disponibles' && (
-        <div className="space-y-4">
+        <div className="space-y-3">
           {/* Mapa de pedidos sin tomar */}
           <DeliveryMap
             orders={availableOrders}
@@ -365,10 +441,6 @@ export default function DeliveryDashboard() {
             centralPoint={settings.central_point_lat && settings.central_point_lng ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : null}
             expandHref="/map-view?scope=delivery-available"
           />
-          <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-4 shadow-[0_8px_30px_rgba(80,17,34,0.03)]">
-            <p className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C] mb-1">Pedidos disponibles</p>
-            <p className="text-[10px] text-[#78686C]">Toca &ldquo;Tomar pedido&rdquo; para asignartelo. Otros deliverys ya no lo veran.</p>
-          </div>
           {availableOrders.length === 0 ? (
             <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-10 text-center" data-testid="no-available">
               <ShoppingBag className="h-10 w-10 text-[#78686C] mx-auto mb-3" />
@@ -376,7 +448,7 @@ export default function DeliveryDashboard() {
               <p className="text-xs text-[#78686C] mt-1">Te aparecera aqui cuando llegue uno nuevo.</p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 [@media(orientation:landscape)_and_(max-height:500px)]:grid-cols-2 sm:grid-cols-2 lg:grid-cols-2 gap-3">
               {sortedAvailableOrders.map(order => {
                 const sched = getScheduleInfo(order);
                 const isWaitForNotice = !!order.wait_for_notice;
@@ -384,64 +456,79 @@ export default function DeliveryDashboard() {
                 const mapsHref = buildMapsHref(order);
                 return (
                 <div key={order.id}
-                  className={`rounded-[1.5rem] border shadow-[0_8px_30px_rgba(80,17,34,0.03)] p-4 space-y-3 transition-all ${
+                  className={`rounded-[1.5rem] border shadow-[0_8px_30px_rgba(80,17,34,0.03)] overflow-hidden transition-all ${
                     locked 
                       ? 'bg-gray-100/90 border-gray-300/80 opacity-60 grayscale pointer-events-none select-none' 
                       : 'bg-white border-[#501122]/10'
                   }`}
                   data-testid={`available-${order.id}`}>
-                  <div>
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0 flex-1">
-                        <p className="font-bold text-[#501122] text-lg min-w-0 truncate">{order.customer_name}</p>
-                        {isWaitForNotice && (
-                          <p className="text-[11px] font-bold text-amber-800 uppercase tracking-wider flex items-center gap-1 mt-0.5" data-testid={`available-wait-notice-${order.id}`}>
-                            <Hourglass className="h-3.5 w-3.5 shrink-0 text-amber-700" />
-                            Esperar aviso activo (Bloqueado)
-                          </p>
-                        )}
+                  <div className="p-4 space-y-3">
+                    <div>
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <p className="font-bold text-[#501122] text-lg min-w-0 truncate">{order.customer_name}</p>
+                          {isWaitForNotice && (
+                            <p className="text-[11px] font-bold text-amber-800 uppercase tracking-wider flex items-center gap-1 mt-0.5" data-testid={`available-wait-notice-${order.id}`}>
+                              <Hourglass className="h-3.5 w-3.5 shrink-0 text-amber-700" />
+                              Esperar aviso activo (Bloqueado)
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex flex-col items-end gap-1 shrink-0">
+                          <span className="text-xs font-bold text-[#3F634A] bg-[#3F634A]/10 border border-[#3F634A]/20 px-2.5 py-1 rounded-full">
+                            Ganancia: {formatUSD(order.delivery_fee || 0)}
+                          </span>
+                          {isWaitForNotice ? (
+                            <Badge className="bg-amber-700 text-white rounded-full px-2.5 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 flex items-center gap-1">
+                              <Hourglass className="h-3 w-3" /> Bloqueado
+                            </Badge>
+                          ) : locked ? (
+                            <Badge className="bg-[#78686C] text-white rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0">Bloqueado</Badge>
+                          ) : null}
+                        </div>
                       </div>
-                      <div className="flex flex-col items-end gap-1 shrink-0">
-                        <span className="text-xs font-bold text-[#3F634A] bg-[#3F634A]/10 border border-[#3F634A]/20 px-2.5 py-1 rounded-full">
-                          Ganancia: {formatUSD(order.delivery_fee || 0)}
-                        </span>
-                        {isWaitForNotice ? (
-                          <Badge className="bg-amber-700 text-white rounded-full px-2.5 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 flex items-center gap-1">
-                            <Hourglass className="h-3 w-3" /> Bloqueado
-                          </Badge>
-                        ) : locked ? (
-                          <Badge className="bg-[#78686C] text-white rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0">Bloqueado</Badge>
-                        ) : null}
-                      </div>
+                      {sched && (
+                        <p className={`text-xs font-semibold flex items-center gap-1 mt-1 ${sched.kind === 'future' ? 'text-[#78686C]' : 'text-[#C27A29]'}`}>
+                          <Clock className="h-3.5 w-3.5" />{sched.label}
+                        </p>
+                      )}
                     </div>
-                    {sched && (
-                      <p className={`text-xs font-semibold flex items-center gap-1 mt-1 ${sched.kind === 'future' ? 'text-[#78686C]' : 'text-[#C27A29]'}`}>
-                        <Clock className="h-3.5 w-3.5" />{sched.label}
-                      </p>
+                    {order.notes && (
+                      <div className="bg-[#C27A29]/10 border border-[#C27A29]/20 rounded-2xl px-3 py-2" data-testid={`av-notes-${order.id}`}>
+                        <p className="text-xs text-[#C27A29] leading-snug"><span className="font-bold">Nota:</span> {order.notes}</p>
+                      </div>
+                    )}
+                    {(order.receiver_name || order.receiver_phone) && (
+                      <div className="bg-[#501122]/5 border border-[#501122]/15 rounded-2xl px-3 py-2" data-testid={`av-receiver-${order.id}`}>
+                        <p className="text-xs text-[#501122] leading-snug">
+                          <span className="font-bold">Recibe otra persona:</span>{' '}
+                          {order.receiver_name || 'Sin nombre'}
+                          {order.receiver_phone ? ` \u00b7 ${order.receiver_phone}` : ''}
+                        </p>
+                      </div>
                     )}
                   </div>
-                  {order.notes && (
-                    <div className="bg-[#C27A29]/10 border border-[#C27A29]/20 rounded-2xl px-3 py-2" data-testid={`av-notes-${order.id}`}>
-                      <p className="text-xs text-[#C27A29] leading-snug"><span className="font-bold">Nota:</span> {order.notes}</p>
-                    </div>
-                  )}
-                  {(order.receiver_name || order.receiver_phone) && (
-                    <div className="bg-[#501122]/5 border border-[#501122]/15 rounded-2xl px-3 py-2" data-testid={`av-receiver-${order.id}`}>
-                      <p className="text-xs text-[#501122] leading-snug">
-                        <span className="font-bold">Recibe otra persona:</span>{' '}
-                        {order.receiver_name || 'Sin nombre'}
-                        {order.receiver_phone ? ` \u00b7 ${order.receiver_phone}` : ''}
-                      </p>
-                    </div>
-                  )}
-                  <div className="grid grid-cols-[1fr_auto] gap-2">
-                    <Button onClick={() => takeOrder(order)} disabled={locked} className="bg-[#501122] hover:bg-[#3D0C19] text-white h-12 rounded-2xl font-bold text-sm disabled:opacity-50 disabled:bg-gray-400" data-testid={`take-${order.id}`}>
-                      {isWaitForNotice ? 'Esperando aviso...' : 'Tomar pedido'}
-                    </Button>
-                    <a href={mapsHref} target="_blank" rel="noopener noreferrer" data-testid={`av-maps-${order.id}`}
+
+                  {/* Split Action Bar flush at bottom */}
+                  <div className="border-t border-[#501122]/10 flex w-full divide-x divide-white/20 text-xs font-bold">
+                    <button
+                      type="button"
+                      onClick={() => takeOrder(order)}
+                      disabled={locked}
+                      data-testid={`take-${order.id}`}
+                      className="flex-1 flex items-center justify-center gap-1.5 h-11 bg-[#501122] hover:bg-[#3D0C19] text-white active:opacity-90 transition-all px-3 disabled:opacity-50 disabled:bg-gray-400"
+                    >
+                      <span>{isWaitForNotice ? 'Esperando aviso...' : 'Tomar pedido'}</span>
+                    </button>
+                    <a
+                      href={mapsHref}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-testid={`av-maps-${order.id}`}
                       title="Ver ubicacion"
-                      className="flex items-center justify-center h-12 w-12 rounded-2xl bg-[#4285F4] text-white active:scale-95 shrink-0">
-                      <MapPin className="h-5 w-5" />
+                      className="w-14 shrink-0 flex items-center justify-center h-11 bg-[#4285F4] hover:bg-[#3367D6] text-white active:opacity-90 transition-all"
+                    >
+                      <MapPin className="h-4 w-4" />
                     </a>
                   </div>
                 </div>
@@ -455,19 +542,19 @@ export default function DeliveryDashboard() {
       {/* ENTREGAS */}
       {activeSection === 'entregas' && (
         <div className="space-y-5">
-          {/* Bento Stats Row */}
-          <div className="grid grid-cols-3 gap-3">
-            <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-4 text-center shadow-[0_8px_30px_rgba(80,17,34,0.03)]">
-              <p className="font-heading text-3xl text-[#C27A29]">{todayStats.pending}</p>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C] mt-1">Pendientes</p>
+          {/* Compact Stats Row with Vertical Dividers */}
+          <div className="bg-white rounded-2xl border border-[#501122]/10 p-2.5 shadow-sm flex items-center divide-x divide-[#501122]/15">
+            <div className="flex-1 text-center px-2">
+              <p className="text-[10px] font-extrabold uppercase tracking-wider text-[#78686C]">Pendientes</p>
+              <p className="font-heading text-xl font-bold text-[#C27A29] mt-0.5">{todayStats.pending}</p>
             </div>
-            <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-4 text-center shadow-[0_8px_30px_rgba(80,17,34,0.03)]">
-              <p className="font-heading text-3xl text-[#3F634A]">{todayStats.delivered}</p>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C] mt-1">Hoy</p>
+            <div className="flex-1 text-center px-2">
+              <p className="text-[10px] font-extrabold uppercase tracking-wider text-[#78686C]">Hoy</p>
+              <p className="font-heading text-xl font-bold text-[#3F634A] mt-0.5">{todayStats.delivered}</p>
             </div>
-            <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-4 text-center shadow-[0_8px_30px_rgba(80,17,34,0.03)]">
-              <p className="font-heading text-2xl text-[#501122]">{formatUSD(todayStats.revenue)}</p>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C] mt-1">Ganado</p>
+            <div className="flex-1 text-center px-2">
+              <p className="text-[10px] font-extrabold uppercase tracking-wider text-[#78686C]">Ganado</p>
+              <p className="font-heading text-lg font-bold text-[#501122] mt-0.5">{formatUSD(todayStats.revenue)}</p>
             </div>
           </div>
 
@@ -489,9 +576,8 @@ export default function DeliveryDashboard() {
               <p className="text-sm text-[#78686C] mt-1">Buen trabajo!</p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 [@media(orientation:landscape)_and_(max-height:500px)]:grid-cols-2 sm:grid-cols-2 lg:grid-cols-2 gap-4">
               {sortedActiveOrders.map(order => {
-                const isExpanded = expandedOrderId === order.id;
                 const itemsSummary = order.items?.map(i => `${i.quantity}x ${i.flavor_name}`).join(', ') || '';
                 const phoneDigits = (order.customer_phone || '').replace(/[^0-9]/g, '');
                 const mapsHref = buildMapsHref(order);
@@ -499,11 +585,12 @@ export default function DeliveryDashboard() {
                 const locked = sched?.kind === 'future';
                 return (
                 <div key={order.id} className={`bg-white rounded-[1.5rem] border border-[#501122]/10 shadow-[0_8px_30px_rgba(80,17,34,0.03)] overflow-hidden transition-all duration-300 hover:-translate-y-0.5 ${locked ? 'opacity-50 pointer-events-none' : ''}`} data-testid={`delivery-order-${order.id}`}>
-                  {/* Header (toggles accordion) */}
-                  <button type="button" onClick={() => setExpandedOrderId(isExpanded ? null : order.id)}
-                    className="w-full p-4 flex justify-between items-center gap-3 text-left active:bg-[#F3EBE0]/40 transition-colors" data-testid={`accordion-toggle-${order.id}`}>
+                  {/* Card Header */}
+                  <div className="w-full p-4 flex justify-between items-start gap-3 text-left">
                     <div className="min-w-0 flex-1">
-                      <span className="text-[10px] font-mono text-[#78686C] block">{order.order_number}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-mono text-[#78686C] block">{order.order_number}</span>
+                      </div>
                       <p className="font-heading text-lg text-[#501122] truncate">{order.customer_name}</p>
                       {order.wait_for_notice && (
                         <p className="text-[11px] font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1 mt-0.5" data-testid={`delivery-order-wait-notice-${order.id}`}>
@@ -518,25 +605,27 @@ export default function DeliveryDashboard() {
                         </p>
                       )}
                     </div>
-                    <div className="flex flex-col items-end gap-1 shrink-0">
-                      {locked
-                        ? <Badge className="bg-[#78686C] text-white rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider border-0">Bloqueado</Badge>
-                        : <Badge className={`${statusColors[order.status]} rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider border-0`}>{statusLabels[order.status]}</Badge>}
-                      {isExpanded ? <ChevronUp className="h-4 w-4 text-[#78686C]" /> : <ChevronDown className="h-4 w-4 text-[#78686C]" />}
-                    </div>
-                  </button>
 
-                  {/* Meta chips siempre visibles (aunque el acordeon este cerrado):
-                      notas, receptor alterno y velitas — mismo criterio que "Pedidos disponibles". */}
-                  {(order.notes || order.receiver_name || order.receiver_phone || order.velitas) && (
+                    <div className="flex flex-col items-end gap-1.5 shrink-0">
+                      <span className="inline-flex items-center gap-0.5 px-2.5 py-0.5 rounded-full bg-[#3F634A]/10 text-[#3F634A] border border-[#3F634A]/20 text-xs font-extrabold font-mono" title="Ganancia del delivery">
+                        {formatUSD(order.delivery_fee || 0)}
+                      </span>
+                      {locked
+                        ? <Badge className="bg-[#78686C] text-white rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0">Bloqueado</Badge>
+                        : <Badge className={`${statusColors[order.status]} rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0`}>{statusLabels[order.status]}</Badge>}
+                    </div>
+                  </div>
+
+                  {/* Meta chips (notas y receptor alterno) */}
+                  {(order.notes || order.receiver_name || order.receiver_phone) && (
                     <div className="px-4 pb-3 space-y-2" data-testid={`always-meta-${order.id}`}>
                       {order.notes && (
-                        <div className="bg-[#C27A29]/10 border border-[#C27A29]/20 rounded-2xl px-3 py-2" data-testid={`mine-notes-${order.id}`}>
+                        <div className="bg-[#C27A29]/10 border border-[#C27A29]/20 rounded-xl px-3 py-1.5" data-testid={`mine-notes-${order.id}`}>
                           <p className="text-xs text-[#C27A29] leading-snug"><span className="font-bold">Nota:</span> {order.notes}</p>
                         </div>
                       )}
                       {(order.receiver_name || order.receiver_phone) && (
-                        <div className="bg-[#501122]/5 border border-[#501122]/15 rounded-2xl px-3 py-2 flex items-center justify-between gap-2" data-testid={`mine-receiver-${order.id}`}>
+                        <div className="bg-[#501122]/5 border border-[#501122]/15 rounded-xl px-3 py-1.5 flex items-center justify-between gap-2" data-testid={`mine-receiver-${order.id}`}>
                           <p className="text-xs text-[#501122] leading-snug min-w-0">
                             <span className="font-bold">Recibe otra persona:</span>{' '}
                             {order.receiver_name || 'Sin nombre'}
@@ -552,115 +641,54 @@ export default function DeliveryDashboard() {
                                 window.open(`https://wa.me/${rDigits}?text=${encodeURIComponent(msg)}`, '_blank');
                               }}
                               data-testid={`mine-receiver-wa-${order.id}`}
-                              className="shrink-0 flex items-center gap-1 h-8 px-3 rounded-full bg-[#25D366] hover:bg-[#20BF5B] text-white text-[11px] font-semibold shadow-sm active:scale-95 transition-all"
+                              className="shrink-0 flex items-center gap-1 h-7 px-2.5 rounded-full bg-[#25D366] hover:bg-[#20BF5B] text-white text-[10px] font-semibold shadow-sm active:scale-95 transition-all"
                               title="Enviar WhatsApp al que recibe"
                             >
-                              <MessageCircle className="h-3.5 w-3.5" />WhatsApp
+                              <MessageCircle className="h-3 w-3" />WhatsApp
                             </button>
                           )}
                         </div>
                       )}
-                      {order.velitas && (
-                        <div className="bg-[#C27A29]/10 border border-[#C27A29]/20 rounded-2xl px-3 py-2 flex items-center gap-2" data-testid={`mine-velitas-${order.id}`}>
-                          <Cake className="h-3.5 w-3.5 text-[#C27A29]" />
-                          <p className="text-xs font-semibold text-[#C27A29]">Con velitas</p>
-                        </div>
-                      )}
                     </div>
                   )}
 
-                  {/* Expandable detail */}
-                  {isExpanded && (
-                    <div>
-                      {/* Items (sin precios) */}
-                      <div className="px-5 py-4 bg-[#F3EBE0]/40 border-t border-[#501122]/5">
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C] mb-2">Productos a entregar</p>
-                        <div className="space-y-1.5 text-sm">
-                          {order.items?.map((it, i) => (
-                            <div key={i} className="flex items-center gap-2 text-[#1F1517]">
-                              <span className="font-medium">- {it.flavor_name}</span>
-                              <span className="text-[#78686C]">x{it.quantity}</span>
-                            </div>
-                          ))}
-                        </div>
-                        {(order.delivery_fee || 0) > 0 && (
-                          <div className="border-t border-[#501122]/10 mt-3 pt-3 flex justify-between items-center">
-                            <span className="font-semibold text-[#501122] text-sm">Mi ganancia</span>
-                            <div className="text-right">
-                              <p className="font-heading text-lg text-[#3F634A]">{formatUSD(order.delivery_fee)}</p>
-                              <p className="text-[10px] text-[#78686C]">{formatVES(order.delivery_fee, rate)}</p>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-
-                      {(order.delivery_address || (order.lat && order.lng)) && (
-                        <div className="px-5 py-3 bg-[#4285F4]/5 border-t border-[#4285F4]/10" data-testid={`delivery-address-block-${order.id}`}>
-                          <div className="flex items-start gap-2">
-                            <MapPin className="h-4 w-4 text-[#4285F4] shrink-0 mt-0.5" />
-                            <div className="min-w-0 flex-1">
-                              <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C] mb-0.5">Direccion</p>
-                              <p className="text-xs text-[#1F1517] break-all" data-testid={`delivery-address-text-${order.id}`}>
-                                {order.lat && order.lng
-                                  ? `${order.lat.toFixed(5)}, ${order.lng.toFixed(5)}`
-                                  : order.delivery_address}
-                              </p>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* notes / receiver / velitas se muestran siempre arriba del acordeon */}
-
-                      {(order.status === 'pendiente' || order.status === 'en_camino') && (
-                        <div className="px-5 py-3 border-t border-[#501122]/5">
-                          <button type="button" onClick={() => releaseOrder(order.id)} data-testid={`release-btn-${order.id}`}
-                            className="w-full flex items-center justify-center gap-2 h-10 rounded-2xl bg-[#C27A29]/10 hover:bg-[#C27A29]/20 text-[#C27A29] text-xs font-semibold active:scale-95 transition-all">
-                            <Undo2 className="h-3.5 w-3.5" />Devolver a Disponibles
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Action Buttons - single row */}
-                  <div className="p-3 border-t border-[#501122]/5 flex items-center gap-2">
-                    {order.status === 'pendiente' && (
-                      <Button onClick={() => {
-                        updateStatus(order.id, 'en_camino');
+                  {/* Split 2-part Action Bar (Flush at bottom of card) */}
+                  <div className="border-t border-[#501122]/10 flex w-full divide-x divide-white/20 text-xs font-bold">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const targetPhone = order.receiver_phone || order.customer_phone || '';
+                        const pDigits = targetPhone.replace(/[^0-9]/g, '');
                         const g = order.customer_gender;
                         const treat = g === 'F' ? ' querida' : (g === 'M' ? ' hermano' : '');
-                        const msg = `*Delivery de Lubo's Tiramisu*\nPedido de ${order.customer_name}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicacion.`;
-                        window.open(`https://wa.me/${phoneDigits}?text=${encodeURIComponent(msg)}`, '_blank');
+                        const isReceiver = !!order.receiver_phone && !!order.receiver_name;
+                        const nameToUse = isReceiver ? order.receiver_name : order.customer_name;
+                        const msg = isReceiver
+                          ? `*Delivery de Lubo's Tiramisu*\nHola ${nameToUse}, te envían un tiramisú de Lubo's. Es ${userName}, ya voy saliendo para tu ubicación para que estés pendiente 🛵`
+                          : `*Delivery de Lubo's Tiramisu*\nPedido de ${order.customer_name}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicación para que estés pendiente 🛵`;
+                        window.open(`https://wa.me/${pDigits}?text=${encodeURIComponent(msg)}`, '_blank');
                       }}
-                        className="flex-1 bg-[#501122] hover:bg-[#3D0C19] text-white h-12 rounded-2xl text-sm font-semibold active:scale-95 shadow-md"
-                        data-testid={`start-delivery-btn-${order.id}`}>
-                        <Truck className="h-4 w-4 mr-1.5" />Empezar
-                      </Button>
-                    )}
-                    {order.status === 'en_camino' && (
-                      <Button onClick={() => updateStatus(order.id, 'entregado')}
-                        className="flex-1 bg-[#3F634A] hover:bg-[#2E4A37] text-white h-12 rounded-2xl text-sm font-semibold active:scale-95 shadow-md"
-                        data-testid={`deliver-btn-${order.id}`}>
-                        <Check className="h-4 w-4 mr-1.5" />Entregado
-                      </Button>
-                    )}
-                    <a href={`https://wa.me/${phoneDigits}?text=${whatsappMessage}`}
-                      target="_blank" rel="noopener noreferrer" data-testid={`whatsapp-btn-${order.id}`}
-                      title="WhatsApp"
-                      className="flex items-center justify-center h-12 w-12 rounded-2xl bg-[#25D366] text-white active:scale-95 shrink-0">
-                      <MessageCircle className="h-5 w-5" />
-                    </a>
-                    <button type="button" onClick={() => callCustomer(order.customer_phone)} data-testid={`call-btn-${order.id}`}
-                      title="Llamar"
-                      className="flex items-center justify-center h-12 w-12 rounded-2xl bg-[#501122] text-white active:scale-95 shrink-0">
-                      <Phone className="h-5 w-5" />
+                      data-testid={`notify-client-btn-${order.id}`}
+                      className="flex-1 flex items-center justify-center gap-1.5 h-11 bg-[#25D366] hover:bg-[#20BF5B] text-white active:opacity-90 transition-all px-2"
+                    >
+                      <MessageCircle className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">Avisar al cliente</span>
                     </button>
-                    <a href={mapsHref} target="_blank" rel="noopener noreferrer" data-testid={`maps-btn-${order.id}`}
-                      title="Ver ruta"
-                      className="flex items-center justify-center h-12 w-12 rounded-2xl bg-[#4285F4] text-white active:scale-95 shrink-0">
-                      <MapPin className="h-5 w-5" />
-                    </a>
+
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (order.status === 'pendiente') {
+                          await updateStatus(order.id, 'en_camino');
+                        }
+                        setActiveRouteOrder(order);
+                      }}
+                      data-testid={`start-route-btn-${order.id}`}
+                      className="flex-1 flex items-center justify-center gap-1.5 h-11 bg-[#501122] hover:bg-[#3D0C19] text-white active:opacity-90 transition-all px-2"
+                    >
+                      <Navigation className="h-3.5 w-3.5 shrink-0 fill-current" />
+                      <span className="truncate">{order.status === 'en_camino' ? 'Ver ruta' : 'Comenzar ruta'}</span>
+                    </button>
                   </div>
                 </div>
                 );
@@ -891,16 +919,199 @@ export default function DeliveryDashboard() {
         </div>
       )}
 
-      {/* Mobile Bottom Nav - Floating Pill */}
-      <div className="fixed bottom-4 left-4 right-4 md:hidden bg-white/90 backdrop-blur-xl border border-[#501122]/10 shadow-xl rounded-[2rem] flex justify-around p-2 z-50">
-        {navItems.map(n => (
-          <button key={n.id} onClick={() => setActiveSection(n.id)} data-testid={`mobile-tab-${n.id}`}
-            className={`relative flex flex-col items-center gap-1 py-2 px-8 rounded-2xl transition-all duration-300 ${activeSection === n.id ? 'text-[#501122] bg-[#501122]/5' : 'text-[#78686C]'}`}>
-            <n.icon className={`h-5 w-5 ${activeSection === n.id ? 'stroke-[2.5px]' : ''}`} />
-            <span className="text-[10px] font-semibold">{n.label}</span>
-          </button>
-        ))}
+      {/* Mobile Fixed Bottom Navigation Bar (Split 50/50: Disponibles & Mis Pedidos) */}
+      <div className="fixed bottom-0 left-0 right-0 md:hidden bg-white border-t border-[#501122]/20 shadow-[0_-8px_30px_rgba(0,0,0,0.18)] h-12 flex z-50 overflow-hidden">
+        {/* Disponibles Half */}
+        <button
+          onClick={() => setActiveSection('disponibles')}
+          data-testid="mobile-tab-disponibles"
+          title="Disponibles"
+          className={`flex-1 flex items-center justify-center gap-1.5 relative h-full border-r border-[#501122]/15 font-bold transition-colors ${
+            activeSection === 'disponibles'
+              ? 'bg-[#501122] text-white'
+              : 'bg-white text-[#501122] hover:bg-[#501122]/5'
+          }`}
+        >
+          <Package className="h-5 w-5" />
+          {availableOrders.length > 0 && (
+            <span className={`px-1.5 py-0.2 min-w-[18px] text-[10px] font-extrabold rounded-full text-center ${
+              activeSection === 'disponibles' ? 'bg-amber-400 text-[#501122]' : 'bg-[#C27A29] text-white'
+            }`}>
+              {availableOrders.length}
+            </span>
+          )}
+        </button>
+
+        {/* Mis Pedidos Half */}
+        <button
+          onClick={() => setActiveSection('entregas')}
+          data-testid="mobile-tab-entregas"
+          title="Mis Pedidos"
+          className={`flex-1 flex items-center justify-center gap-1.5 relative h-full font-bold transition-colors ${
+            activeSection === 'entregas'
+              ? 'bg-[#501122] text-white'
+              : 'bg-white text-[#501122] hover:bg-[#501122]/5'
+          }`}
+        >
+          <Truck className="h-5 w-5" />
+          {activeOrders.length > 0 && (
+            <span className={`px-1.5 py-0.2 min-w-[18px] text-[10px] font-extrabold rounded-full text-center ${
+              activeSection === 'entregas' ? 'bg-emerald-400 text-[#501122]' : 'bg-[#3F634A] text-white'
+            }`}>
+              {activeOrders.length}
+            </span>
+          )}
+        </button>
       </div>
+
+      {/* Full-Screen Route Navigation View */}
+      {currentRouteOrder && (
+        <div className="fixed inset-0 z-50 bg-[#FBF7F0] flex flex-col overflow-hidden animate-in fade-in duration-200" data-testid="route-navigation-modal">
+          {/* Compact Top Header Floating Card */}
+          <div className="absolute top-2.5 left-2.5 right-2.5 [@media(orientation:landscape)_and_(max-height:500px)]:right-auto [@media(orientation:landscape)_and_(max-height:500px)]:w-[300px] z-30 bg-white/95 backdrop-blur-md border border-[#501122]/15 shadow-xl rounded-2xl p-2.5 px-3 flex items-center justify-between gap-2.5">
+
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#501122]/10 text-[#501122]">
+                  {currentRouteOrder.order_number}
+                </span>
+                <Badge className={`${statusColors[currentRouteOrder.status] || 'bg-blue-100 text-blue-700'} rounded-full px-2 py-0.2 text-[9px] font-bold uppercase border-0`}>
+                  {statusLabels[currentRouteOrder.status] || currentRouteOrder.status}
+                </Badge>
+              </div>
+              <p className="font-heading text-sm font-bold text-[#501122] truncate mt-0.5">
+                {currentRouteOrder.customer_name}
+              </p>
+              <p className="text-[11px] text-[#78686C] truncate flex items-center gap-1">
+                <MapPin className="h-3 w-3 shrink-0 text-[#4285F4]" />
+                {currentRouteOrder.delivery_address || (currentRouteOrder.lat && currentRouteOrder.lng ? `${currentRouteOrder.lat.toFixed(4)}, ${currentRouteOrder.lng.toFixed(4)}` : 'Ubicación seleccionada')}
+              </p>
+            </div>
+
+            {/* Top Right Action: GPS External & Exit "X" */}
+            <div className="flex items-center gap-1.5 shrink-0">
+              {buildMapsHref(currentRouteOrder) && (
+                <a
+                  href={buildMapsHref(currentRouteOrder)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="h-9 w-9 flex items-center justify-center rounded-xl bg-[#4285F4] hover:bg-[#3367D6] text-white active:scale-95 transition-all shadow-sm"
+                  title="Abrir en Waze / Google Maps"
+                >
+                  <ExternalLink className="h-4 w-4" />
+                </a>
+              )}
+              <button
+                type="button"
+                onClick={() => setActiveRouteOrder(null)}
+                data-testid="close-route-modal-btn"
+                className="h-9 w-9 flex items-center justify-center rounded-xl bg-gray-100 hover:bg-gray-200 text-[#501122] active:scale-95 transition-all shadow-sm"
+                title="Salir de la ruta"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Full Screen Navigation Map Area (extends behind top floating banner) */}
+          <div className="absolute inset-0 z-10 w-full h-full">
+            <DeliveryNavigationMap
+              order={currentRouteOrder}
+              centralPoint={settings.central_point_lat && settings.central_point_lng ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : null}
+              testId="route-modal-navigation-map"
+            />
+          </div>
+
+          {/* Compact Bottom Overlay Area (Banners & Action Controls) */}
+          <div className="mt-auto relative z-30 bg-white border-t border-[#501122]/15 shadow-[0_-8px_30px_rgba(80,17,34,0.15)] rounded-t-2xl overflow-hidden max-h-[50vh] [@media(orientation:landscape)_and_(max-height:500px)]:mt-0 [@media(orientation:landscape)_and_(max-height:500px)]:absolute [@media(orientation:landscape)_and_(max-height:500px)]:top-auto [@media(orientation:landscape)_and_(max-height:500px)]:left-2.5 [@media(orientation:landscape)_and_(max-height:500px)]:bottom-2.5 [@media(orientation:landscape)_and_(max-height:500px)]:w-[300px] [@media(orientation:landscape)_and_(max-height:500px)]:max-h-[calc(100vh-96px)] [@media(orientation:landscape)_and_(max-height:500px)]:rounded-2xl [@media(orientation:landscape)_and_(max-height:500px)]:border [@media(orientation:landscape)_and_(max-height:500px)]:shadow-xl flex flex-col justify-between">
+            {/* Inner Padding Content Area */}
+            <div className="p-2.5 px-3 space-y-2 overflow-y-auto">
+              {/* Banner 1: Recibe otra persona */}
+              {(currentRouteOrder.receiver_name || currentRouteOrder.receiver_phone) && (
+                <div className="bg-[#501122]/5 border border-[#501122]/15 rounded-xl p-2 px-2.5 flex items-center justify-between gap-2" data-testid="route-modal-receiver-banner">
+                  <div className="min-w-0">
+                    <span className="text-[9px] font-extrabold uppercase tracking-wider text-[#501122] block">Recibe otra persona</span>
+                    <p className="text-xs font-bold text-[#1F1517] truncate">
+                      {currentRouteOrder.receiver_name || 'Sin nombre'} {currentRouteOrder.receiver_phone ? `(${currentRouteOrder.receiver_phone})` : ''}
+                    </p>
+                  </div>
+                  {currentRouteOrder.receiver_phone && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const rDigits = (currentRouteOrder.receiver_phone || '').replace(/[^0-9]/g, '');
+                        const msg = `*Delivery de Lubo's Tiramisu*\nHola ${currentRouteOrder.receiver_name || ''}, te envían un tiramisú de Lubo's. Es ${userName}, ya voy en camino a la ubicación 🛵`;
+                        window.open(`https://wa.me/${rDigits}?text=${encodeURIComponent(msg)}`, '_blank');
+                      }}
+                      className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#25D366] text-white text-[11px] font-bold active:scale-95 shadow-sm"
+                    >
+                      <MessageCircle className="h-3.5 w-3.5" /> WhatsApp
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Banner 2: Nota del vendedor */}
+              {currentRouteOrder.notes && (
+                <div className="bg-[#C27A29]/10 border border-[#C27A29]/25 rounded-xl p-2 px-2.5" data-testid="route-modal-notes-banner">
+                  <span className="text-[9px] font-extrabold uppercase tracking-wider text-[#C27A29] block">Nota del vendedor</span>
+                  <p className="text-xs font-medium text-[#1F1517] leading-tight mt-0.5">{currentRouteOrder.notes}</p>
+                </div>
+              )}
+
+              {/* Avisar y Llamar split buttons */}
+              <div className="flex w-full rounded-xl overflow-hidden divide-x divide-white/20 text-xs font-bold shadow-sm border border-[#501122]/10">
+                {/* Button 1: Avisar (Ya llegué) */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetPhone = currentRouteOrder.receiver_phone || currentRouteOrder.customer_phone || '';
+                    const digits = targetPhone.replace(/[^0-9]/g, '');
+                    const nameToUse = (currentRouteOrder.receiver_phone && currentRouteOrder.receiver_name)
+                      ? currentRouteOrder.receiver_name
+                      : currentRouteOrder.customer_name;
+                    const msg = `*Delivery de Lubo's Tiramisu*\nHola ${nameToUse}, ¡ya estoy abajo con tu pedido! 🧁`;
+                    window.open(`https://wa.me/${digits}?text=${encodeURIComponent(msg)}`, '_blank');
+                  }}
+                  data-testid="route-modal-notify-arrived-btn"
+                  className="flex-1 flex items-center justify-center gap-1.5 h-10 bg-[#25D366] hover:bg-[#20BF5B] text-white active:opacity-90 transition-all px-2"
+                >
+                  <MessageCircle className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate">Avisar llegué</span>
+                </button>
+
+                {/* Button 2: Llamar */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetPhone = currentRouteOrder.receiver_phone || currentRouteOrder.customer_phone || '';
+                    callCustomer(targetPhone);
+                  }}
+                  data-testid="route-modal-call-btn"
+                  className="flex-1 flex items-center justify-center gap-1.5 h-10 bg-[#501122] hover:bg-[#3D0C19] text-white active:opacity-90 transition-all px-2"
+                >
+                  <Phone className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate">Llamar</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Big "Entregado" Button - Full Width Bar Flush at Bottom */}
+            <button
+              type="button"
+              onClick={async () => {
+                await updateStatus(currentRouteOrder.id, 'entregado');
+                setActiveRouteOrder(null);
+              }}
+              data-testid="route-modal-delivered-btn"
+              className="w-full flex items-center justify-center gap-2 h-12 bg-[#3F634A] hover:bg-[#2E4A37] text-white text-sm font-extrabold uppercase tracking-wider active:opacity-90 transition-all shrink-0 border-t border-[#3F634A]"
+            >
+              <Check className="h-5 w-5 stroke-[3]" />
+              <span>Entregado</span>
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

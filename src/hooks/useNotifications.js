@@ -287,14 +287,16 @@ export function useNotifications() {
 
   useEffect(() => {
     fetchNotifications();
-    const interval = setInterval(fetchNotifications, 4000);
+    const interval = setInterval(fetchNotifications, 5000);
     const onVisible = () => { if (document.visibilityState === 'visible') fetchNotifications(); };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', fetchNotifications);
+    window.addEventListener('lubos:notifications-changed', fetchNotifications);
     return () => {
       clearInterval(interval);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', fetchNotifications);
+      window.removeEventListener('lubos:notifications-changed', fetchNotifications);
     };
   }, [fetchNotifications]);
 

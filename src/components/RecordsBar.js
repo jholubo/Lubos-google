@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Trophy } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import api, { formatUSD } from '@/lib/api';
+import { getLocalCache, setLocalCache } from '@/lib/cache';
 
 const fireConfetti = (color) => {
   const end = Date.now() + 2000;
@@ -15,7 +16,7 @@ const fireConfetti = (color) => {
   })();
 };
 
-export default function RecordsBar() {
+export default function RecordsBar({ collapsed = false }) {
   const [data, setData] = useState(null);
   // Track previous broken state so we trigger the confetti ONLY on the transition.
   const lastDailyBrokenRef = useRef(false);
@@ -23,9 +24,14 @@ export default function RecordsBar() {
   const initializedRef = useRef(false);
 
   const load = useCallback(async () => {
+    // Instant cache read
+    const cRec = getLocalCache('dashboard_records');
+    if (cRec && !data) setData(cRec);
+
     try {
       const r = await api.get('/dashboard/records');
       const d = r.data;
+      setLocalCache('dashboard_records', d);
       // On the very first load, just initialize refs without celebration.
       if (!initializedRef.current) {
         lastDailyBrokenRef.current = !!d?.today?.broken;
@@ -39,14 +45,19 @@ export default function RecordsBar() {
       }
       setData(d);
     } catch { /* keep last data */ }
-  }, []);
+  }, [data]);
 
   useEffect(() => {
     load();
     const id = setInterval(load, 30000);
     const onVis = () => { if (document.visibilityState === 'visible') load(); };
     document.addEventListener('visibilitychange', onVis);
-    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVis); };
+    window.addEventListener('lubos:orders-changed', load);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('lubos:orders-changed', load);
+    };
   }, [load]);
 
   if (!data) return null;
@@ -57,40 +68,138 @@ export default function RecordsBar() {
   const dailyBroken = today.broken;
   const monthlyBroken = month.broken;
 
+  const todayTooltip = `Hoy: ${formatUSD(today.revenue)} / ${today.record > 0 ? formatUSD(today.record) : '--'} (${Math.round(dailyPct)}%)`;
+  const monthTooltip = `Mes: ${formatUSD(month.revenue)} / ${month.is_first_month ? 'definiendo' : formatUSD(month.record)} (${Math.round(monthlyPct)}%)`;
+
+  // Collapsed Sidebar View: Sleek Vertical Bars
+  if (collapsed) {
+    return (
+      <div
+        className="w-full flex flex-col items-center gap-1 py-2 px-1 bg-[#501122]/[0.03] hover:bg-[#501122]/[0.07] rounded-2xl border border-[#501122]/15 shadow-2xs transition-all cursor-default"
+        data-testid="records-bar-collapsed"
+        title={`${todayTooltip}\n${monthTooltip}`}
+      >
+        <div className="flex items-center justify-center text-[#501122]">
+          <Trophy className="h-3.5 w-3.5 text-[#C27A29] shrink-0" />
+        </div>
+
+        {/* Taller Vertical Progress Bars Side-by-Side */}
+        <div className="flex items-end justify-center gap-1.5 h-32 my-0.5">
+          {/* Hoy Vertical Bar */}
+          <div className="flex flex-col items-center gap-1 h-full w-3" title={todayTooltip}>
+            <div className="relative w-2.5 flex-1 bg-amber-100/80 rounded-full overflow-hidden flex flex-col justify-end p-0.5 border border-amber-200/60 shadow-inner">
+              <div
+                className={`w-full rounded-full transition-[height] duration-500 ${
+                  dailyBroken
+                    ? 'bg-gradient-to-t from-amber-500 to-amber-300 animate-pulse shadow-[0_0_8px_rgba(217,138,50,0.9)]'
+                    : 'bg-gradient-to-t from-[#C27A29] to-amber-400'
+                }`}
+                style={{ height: `${dailyPct}%` }}
+              />
+            </div>
+            <span className="text-[9px] font-black text-[#C27A29] leading-none uppercase">H</span>
+          </div>
+
+          {/* Mes Vertical Bar */}
+          <div className="flex flex-col items-center gap-1 h-full w-3" title={monthTooltip}>
+            <div className="relative w-2.5 flex-1 bg-[#501122]/10 rounded-full overflow-hidden flex flex-col justify-end p-0.5 border border-[#501122]/20 shadow-inner">
+              <div
+                className={`w-full rounded-full transition-[height] duration-500 ${
+                  monthlyBroken
+                    ? 'bg-gradient-to-t from-[#501122] to-[#902244] animate-pulse shadow-[0_0_8px_rgba(80,17,34,0.9)]'
+                    : 'bg-gradient-to-t from-[#501122] to-[#701C33]'
+                }`}
+                style={{ height: `${monthlyPct}%` }}
+              />
+            </div>
+            <span className="text-[9px] font-black text-[#501122] leading-none uppercase">M</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Expanded Sidebar View: Premium Brand Card for Sales Records
   return (
-    <div className="flex-1 min-w-0 max-w-md hidden md:flex flex-col gap-0.5 px-3" data-testid="records-bar">
-      {/* Daily Record */}
-      <div className="flex items-center gap-2" data-testid="record-daily">
-        <span className="text-[9px] font-bold uppercase tracking-wider text-blue-600 w-9 shrink-0 flex items-center gap-0.5">
-          {dailyBroken && <Trophy className="h-2.5 w-2.5" />}
-          Hoy
+    <div className="w-full flex flex-col gap-2.5 p-3 rounded-2xl bg-gradient-to-b from-[#501122]/[0.04] to-[#501122]/[0.01] border border-[#501122]/12 shadow-2xs" data-testid="records-bar">
+      <div className="flex items-center justify-between text-[10px] font-extrabold text-[#501122] uppercase tracking-wider pb-1.5 border-b border-[#501122]/10">
+        <span className="flex items-center gap-1.5">
+          <Trophy className="h-3.5 w-3.5 text-[#C27A29]" />
+          Récords de Ventas
         </span>
-        <div className="flex-1 h-2.5 bg-blue-100 rounded-full overflow-hidden">
+        <span className="text-[9px] font-bold text-[#78686C] bg-[#501122]/5 px-1.5 py-0.5 rounded">USD</span>
+      </div>
+
+      {/* Daily Record */}
+      <div className="space-y-1" data-testid="record-daily">
+        <div className="flex items-center justify-between text-xs">
+          <span className="font-bold text-[#501122] flex items-center gap-1">
+            Hoy
+            {dailyBroken ? (
+              <span className="text-[8px] bg-amber-100 text-amber-800 border border-amber-300/60 px-1.5 py-0.2 rounded-full font-extrabold animate-pulse">
+                🏆 ¡Superado!
+              </span>
+            ) : (
+              <span className="text-[9px] bg-[#C27A29]/10 text-[#C27A29] px-1.5 py-0.2 rounded-md font-extrabold">
+                {Math.round(dailyPct)}%
+              </span>
+            )}
+          </span>
+          <div className="text-right">
+            <span className="font-extrabold text-[#1F1517] text-xs tabular-nums">
+              {formatUSD(today.revenue)}
+            </span>
+            <span className="text-[10px] text-[#78686C] font-semibold tabular-nums ml-1">
+              / {today.record > 0 ? formatUSD(today.record) : '--'}
+            </span>
+          </div>
+        </div>
+        <div className="w-full h-2 bg-[#501122]/10 rounded-full overflow-hidden p-0.5">
           <div
-            className={`h-full rounded-full bg-blue-500 transition-[width] duration-500 ${dailyBroken ? 'animate-pulse shadow-[0_0_10px_rgba(59,130,246,0.9)]' : ''}`}
+            className={`h-full rounded-full transition-all duration-500 ${
+              dailyBroken
+                ? 'bg-gradient-to-r from-amber-400 to-amber-600 animate-pulse shadow-[0_0_10px_rgba(217,138,50,0.8)]'
+                : 'bg-gradient-to-r from-amber-500 to-[#C27A29]'
+            }`}
             style={{ width: `${dailyPct}%` }}
           />
         </div>
-        <span className="text-[9px] font-semibold text-[#1F1517] tabular-nums shrink-0 whitespace-nowrap" title={today.record_date ? `Record: ${today.record_date}` : 'Sin record previo'}>
-          {formatUSD(today.revenue)} <span className="text-[#78686C]">/ {today.record > 0 ? formatUSD(today.record) : '--'}</span>
-        </span>
       </div>
 
       {/* Monthly Record */}
-      <div className="flex items-center gap-2" data-testid="record-monthly">
-        <span className="text-[9px] font-bold uppercase tracking-wider text-purple-600 w-9 shrink-0 flex items-center gap-0.5">
-          {monthlyBroken && <Trophy className="h-2.5 w-2.5" />}
-          Mes
-        </span>
-        <div className="flex-1 h-1.5 bg-purple-100 rounded-full overflow-hidden">
+      <div className="space-y-1" data-testid="record-monthly">
+        <div className="flex items-center justify-between text-xs">
+          <span className="font-bold text-[#501122] flex items-center gap-1">
+            Mes
+            {monthlyBroken ? (
+              <span className="text-[8px] bg-purple-100 text-purple-800 border border-purple-300/60 px-1.5 py-0.2 rounded-full font-extrabold animate-pulse">
+                🏆 ¡Superado!
+              </span>
+            ) : (
+              <span className="text-[9px] bg-[#501122]/10 text-[#501122] px-1.5 py-0.2 rounded-md font-extrabold">
+                {Math.round(monthlyPct)}%
+              </span>
+            )}
+          </span>
+          <div className="text-right">
+            <span className="font-extrabold text-[#1F1517] text-xs tabular-nums">
+              {formatUSD(month.revenue)}
+            </span>
+            <span className="text-[10px] text-[#78686C] font-semibold tabular-nums ml-1">
+              / {month.is_first_month ? 'definiendo' : formatUSD(month.record)}
+            </span>
+          </div>
+        </div>
+        <div className="w-full h-2 bg-[#501122]/10 rounded-full overflow-hidden p-0.5">
           <div
-            className={`h-full rounded-full bg-purple-500 transition-[width] duration-500 ${monthlyBroken ? 'animate-pulse shadow-[0_0_10px_rgba(168,85,247,0.9)]' : ''}`}
+            className={`h-full rounded-full transition-all duration-500 ${
+              monthlyBroken
+                ? 'bg-gradient-to-r from-[#701C33] to-[#A0284A] animate-pulse shadow-[0_0_10px_rgba(80,17,34,0.8)]'
+                : 'bg-gradient-to-r from-[#501122] to-[#701C33]'
+            }`}
             style={{ width: `${monthlyPct}%` }}
           />
         </div>
-        <span className="text-[9px] font-semibold text-[#1F1517] tabular-nums shrink-0 whitespace-nowrap" title={month.record_month ? `Record: ${month.record_month}` : 'Primer mes'}>
-          {formatUSD(month.revenue)} <span className="text-[#78686C]">/ {month.is_first_month ? 'definiendo' : formatUSD(month.record)}</span>
-        </span>
       </div>
     </div>
   );

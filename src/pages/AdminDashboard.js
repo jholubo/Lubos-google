@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useBackButtonClose } from '@/hooks/useBackButtonClose';
 import { toast } from 'sonner';
 import api, { formatUSD, formatVES } from '@/lib/api';
+import { getLocalCache, setLocalCache } from '@/lib/cache';
+import { notifyLocalChange } from '@/lib/dataSync';
 import { useNotifications, playNotificationSound } from '@/hooks/useNotifications';
 import usePushSubscription from '@/hooks/usePushSubscription';
 import { fuzzyMatch, fuzzyCommandFilter } from '@/lib/searchUtils';
@@ -164,7 +166,12 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const [expandedFinanceDelivery, setExpandedFinanceDelivery] = useState(null);
 
   const loadFast = useCallback(async () => {
-    // Datos "vivos" que sí cambian por polling: pedidos + stats resumen + ubicaciones deliverys.
+    // Instant cache read
+    const cStats = getLocalCache('admin_stats');
+    if (cStats) setStats(cStats);
+    const cOrders = getLocalCache('admin_orders');
+    if (cOrders && !statusFilter && !dateFrom && !dateTo) setOrders(cOrders);
+
     try {
       const orderParams = {};
       if (statusFilter && statusFilter !== 'all') orderParams.status = statusFilter;
@@ -176,19 +183,32 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
         api.get('/delivery/locations').catch(() => ({ data: [] })),
       ]);
       setStats(st.data);
+      setLocalCache('admin_stats', st.data);
       setOrders(ord.data);
+      if (!statusFilter && !dateFrom && !dateTo) setLocalCache('admin_orders', ord.data);
       setDeliveryLocations(locs.data || []);
     } catch { /* silencio en polling */ }
   }, [statusFilter, dateFrom, dateTo]);
 
   const loadSlow = useCallback(async () => {
-    // Datos que rara vez cambian: solo al montar / enfocar / tras mutaciones.
+    const cFlavors = getLocalCache('flavors');
+    if (cFlavors) setFlavors(cFlavors);
+    const cUsers = getLocalCache('users');
+    if (cUsers) setUsers(cUsers);
+    const cSettings = getLocalCache('settings');
+    if (cSettings) {
+      setSettings(cSettings);
+      setExchangeRate(String(cSettings.exchange_rate_ves || 36.5));
+    }
+
     try {
       const usersEndpoint = isAdmin ? '/users' : '/users/deliveries';
       const [fl, us, se] = await Promise.all([
         api.get('/flavors'), api.get(usersEndpoint), api.get('/settings'),
       ]);
-      setFlavors(fl.data); setUsers(us.data); setSettings(se.data);
+      setFlavors(fl.data); setLocalCache('flavors', fl.data);
+      setUsers(us.data); setLocalCache('users', us.data);
+      setSettings(se.data); setLocalCache('settings', se.data);
       setExchangeRate(String(se.data.exchange_rate_ves || 36.5));
     } catch { toast.error('Error cargando datos'); }
   }, [isAdmin]);
@@ -200,17 +220,23 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   useEffect(() => {
     loadFast();
     loadSlow();
-    const interval = setInterval(loadFast, 12000);
+    const interval = setInterval(loadFast, 15000);
     const onVisible = () => { if (document.visibilityState === 'visible') loadFast(); };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', loadFast);
-    // Refresco instantaneo cuando otro perfil crea/actualiza un pedido (via useNotifications).
+    // Refresco instantaneo cuando se crea/modifica un pedido o recurso
     window.addEventListener('lubos:orders-changed', loadFast);
+    window.addEventListener('lubos:notifications-changed', loadFast);
+    window.addEventListener('lubos:flavors-changed', loadSlow);
+    window.addEventListener('lubos:settings-changed', loadSlow);
     return () => {
       clearInterval(interval);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', loadFast);
       window.removeEventListener('lubos:orders-changed', loadFast);
+      window.removeEventListener('lubos:notifications-changed', loadFast);
+      window.removeEventListener('lubos:flavors-changed', loadSlow);
+      window.removeEventListener('lubos:settings-changed', loadSlow);
     };
   }, [loadFast, loadSlow]);
 
@@ -360,17 +386,24 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   };
 
   const updateStatus = async (orderId, status) => {
-    try {
-      // Find the order BEFORE the update to detect "sin_pagar -> pendiente" (Pagado click)
-      const prev = orders.find(o => o.id === orderId);
-      await api.patch(`/orders/${orderId}/status`, { status });
-      if (prev?.status === 'sin_pagar' && status === 'pendiente') {
-        playNotificationSound('new_sale'); // caja registradora
-      }
-      toast.success('Estado actualizado');
-      loadAll();
+    const prev = orders.find(o => o.id === orderId);
+    const prevStatus = prev?.status;
+
+    // 0ms Optimistic UI update
+    setOrders(p => p.map(o => o.id === orderId ? { ...o, status } : o));
+    if (prevStatus === 'sin_pagar' && status === 'pendiente') {
+      playNotificationSound('new_sale'); // caja registradora instantanea
     }
-    catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+    notifyLocalChange('orders_changed');
+    toast.success('Estado actualizado');
+
+    try {
+      await api.patch(`/orders/${orderId}/status`, { status });
+    } catch (err) {
+      // Revert on error
+      setOrders(p => p.map(o => o.id === orderId ? { ...o, status: prevStatus } : o));
+      toast.error(err.response?.data?.detail || 'Error actualizando estado');
+    }
   };
 
   // Resize and compress image to a square 256x256 base64 JPEG
@@ -487,13 +520,22 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   };
 
   const cancelOrder = async (orderId) => {
-    try { await api.patch(`/orders/${orderId}/status`, { status: 'cancelado' }); toast.success('Cancelado'); loadAll(); }
-    catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+    const prevOrder = orders.find(o => o.id === orderId);
+    setOrders(p => p.map(o => o.id === orderId ? { ...o, status: 'cancelado' } : o));
+    notifyLocalChange('orders_changed');
+    toast.success('Pedido cancelado');
+    try {
+      await api.patch(`/orders/${orderId}/status`, { status: 'cancelado' });
+    } catch (err) {
+      if (prevOrder) setOrders(p => p.map(o => o.id === orderId ? prevOrder : o));
+      toast.error(err.response?.data?.detail || 'Error al cancelar');
+    }
   };
 
   const togglePrepared = async (orderId, prepared) => {
     // Optimistic update for instant UI feedback
     setOrders(prev => prev.map(o => o.id === orderId ? { ...o, prepared, prepared_by_name: prepared ? o.prepared_by_name : null } : o));
+    notifyLocalChange('orders_changed');
     try {
       const res = await api.patch(`/orders/${orderId}/prepared`, { prepared });
       // Sync server fields (prepared_by_name, prepared_at)
@@ -508,6 +550,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const toggleWaitNotice = async (orderId, currentVal) => {
     const nextVal = !currentVal;
     setOrders(prev => prev.map(o => o.id === orderId ? { ...o, wait_for_notice: nextVal } : o));
+    notifyLocalChange('orders_changed');
     try {
       const res = await api.patch(`/orders/${orderId}/toggle-wait-notice`, { wait_for_notice: nextVal });
       setOrders(prev => prev.map(o => o.id === orderId ? { ...o, ...res.data } : o));
@@ -522,9 +565,20 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const [deletingOrderId, setDeletingOrderId] = useState(null);
   const confirmDeleteOrder = async () => {
     if (!deletingOrderId) return;
-    await api.delete(`/orders/${deletingOrderId}`);
+    const targetId = deletingOrderId;
+    const targetOrder = orders.find(o => o.id === targetId);
+
+    setOrders(p => p.filter(o => o.id !== targetId));
+    notifyLocalChange('orders_changed');
+    setDeletingOrderId(null);
     toast.success('Pedido eliminado');
-    loadAll();
+
+    try {
+      await api.delete(`/orders/${targetId}`);
+    } catch (err) {
+      if (targetOrder) setOrders(p => [...p, targetOrder]);
+      toast.error(err.response?.data?.detail || 'Error al eliminar');
+    }
   };
 
   // Edit order
@@ -533,20 +587,33 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   // Unassign delivery (return to "Disponibles" pool)
   const unassignDelivery = async (orderId) => {
     if (!window.confirm('Liberar este pedido para que otro delivery lo tome?')) return;
+    const targetOrder = orders.find(o => o.id === orderId);
+    setOrders(p => p.map(o => o.id === orderId ? { ...o, delivery_id: null, delivery_name: null } : o));
+    notifyLocalChange('orders_changed');
+    toast.success('Pedido devuelto a Disponibles');
+
     try {
       await api.post(`/orders/${orderId}/unassign-delivery`);
-      toast.success('Pedido devuelto a Disponibles');
-      loadAll();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+    } catch (err) {
+      if (targetOrder) setOrders(p => p.map(o => o.id === orderId ? targetOrder : o));
+      toast.error(err.response?.data?.detail || 'Error');
+    }
   };
 
   // Assign / reassign a delivery user on a pending order
   const assignDelivery = async (orderId, deliveryId) => {
+    const targetOrder = orders.find(o => o.id === orderId);
+    const delUser = users.find(u => u.id === deliveryId);
+    setOrders(p => p.map(o => o.id === orderId ? { ...o, delivery_id: deliveryId, delivery_name: delUser?.name || 'Delivery' } : o));
+    notifyLocalChange('orders_changed');
+    toast.success('Delivery asignado');
+
     try {
       await api.post(`/orders/${orderId}/assign-delivery`, { delivery_id: deliveryId });
-      toast.success('Delivery asignado');
-      loadAll();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error al asignar'); }
+    } catch (err) {
+      if (targetOrder) setOrders(p => p.map(o => o.id === orderId ? targetOrder : o));
+      toast.error(err.response?.data?.detail || 'Error al asignar');
+    }
   };
 
   const formatDate = (iso) => iso ? new Date(iso).toLocaleString('es-VE', { timeZone: 'America/Caracas', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';

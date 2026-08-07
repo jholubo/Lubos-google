@@ -19,11 +19,11 @@ async function main() {
   // 1. Users
   await prisma.user.upsert({
     where: { username: 'jhonny' },
-    update: {},
+    update: { password_hash: hashPassword('1234') },
     create: {
       id: 'u-jhonny-001',
       username: 'jhonny',
-      password_hash: hashPassword('jhonny123'),
+      password_hash: hashPassword('1234'),
       name: 'Jhonny',
       role: 'admin',
     },
@@ -31,11 +31,11 @@ async function main() {
 
   await prisma.user.upsert({
     where: { username: 'ivan' },
-    update: {},
+    update: { password_hash: hashPassword('1234') },
     create: {
       id: 'u-ivan-002',
       username: 'ivan',
-      password_hash: hashPassword('ivan123'),
+      password_hash: hashPassword('1234'),
       name: 'Ivan',
       role: 'vendedor',
     },
@@ -43,11 +43,11 @@ async function main() {
 
   await prisma.user.upsert({
     where: { username: 'oscar' },
-    update: {},
+    update: { password_hash: hashPassword('1234') },
     create: {
       id: 'u-oscar-003',
       username: 'oscar',
-      password_hash: hashPassword('oscar123'),
+      password_hash: hashPassword('1234'),
       name: 'Oscar',
       role: 'delivery',
     },
@@ -55,11 +55,11 @@ async function main() {
 
   await prisma.user.upsert({
     where: { username: 'carlos' },
-    update: {},
+    update: { password_hash: hashPassword('1234') },
     create: {
       id: 'u-carlos-004',
       username: 'carlos',
-      password_hash: hashPassword('carlos123'),
+      password_hash: hashPassword('1234'),
       name: 'Carlos Delivery',
       role: 'delivery',
     },

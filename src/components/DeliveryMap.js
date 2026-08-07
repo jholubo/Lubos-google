@@ -355,7 +355,7 @@ export function isScheduledForFutureDay(scheduledForStr) {
   }
 }
 
-function DeliveryMapInner({ isLoaded, loadError, orders, title = 'Mapa de Entregas', subtitle, testId = 'delivery-map', hideFutureDays = true, centralPoint = null, expandHref = null, defaultHeight = 320, minimal = false, deliveryLocations = [] }) {
+function DeliveryMapInner({ isLoaded, loadError, orders, title = 'Mapa de Entregas', subtitle, testId = 'delivery-map', hideFutureDays = true, centralPoint = null, expandHref = null, defaultHeight = 320, minimal = false, deliveryLocations = [], showRoute = false }) {
   const [centerRequestId, setCenterRequestId] = useState(0);
   const [fitAllRequestId, setFitAllRequestId] = useState(0);
 
@@ -448,7 +448,7 @@ function DeliveryMapInner({ isLoaded, loadError, orders, title = 'Mapa de Entreg
             </div>
 
             <div className="w-full h-full">
-              <MapBody orders={visibleOrders} height="100%" centralPoint={centralPoint} centerRequestId={centerRequestId} fitAllRequestId={fitAllRequestId} deliveryLocations={deliveryLocations} />
+              <MapBody orders={visibleOrders} height="100%" centralPoint={centralPoint} centerRequestId={centerRequestId} fitAllRequestId={fitAllRequestId} deliveryLocations={deliveryLocations} showRoute={showRoute} />
             </div>
 
             {/* Bottom Center Floating Encuadrar Button */}
