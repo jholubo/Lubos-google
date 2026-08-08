@@ -30,6 +30,9 @@ function dispatchLocalEvent(eventType, payload) {
     if (eventType === 'settings_changed') {
       window.dispatchEvent(new CustomEvent('lubos:settings-changed', { detail: payload }));
     }
+    if (eventType === 'customers_changed') {
+      window.dispatchEvent(new CustomEvent('lubos:customers-changed', { detail: payload }));
+    }
     window.dispatchEvent(new CustomEvent('lubos:data-updated', { detail: { event: eventType, payload } }));
   } catch (e) {
     console.warn('[dataSync] error dispatching event:', e);

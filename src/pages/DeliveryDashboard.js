@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { useAuth } from '@/contexts/AuthContext';
@@ -49,6 +49,44 @@ export default function DeliveryDashboard() {
   const [settings, setSettings] = useState({ exchange_rate_ves: 36.5 });
   const [deliveryStats, setDeliveryStats] = useState(null);
   const [dataPeriod, setDataPeriod] = useState('week');
+  const [geoPermissionGranted, setGeoPermissionGranted] = useState(() => {
+    return localStorage.getItem('lubos_geo_permission') === 'granted';
+  });
+  const watchIdRef = useRef(null);
+  const lastCoordsRef = useRef(null);
+  const lastSentRef = useRef(0);
+
+  const sendLocation = useCallback(async (lat, lng) => {
+    const now = Date.now();
+    if (now - lastSentRef.current < 12000) return; // rate limit ~12s
+    lastSentRef.current = now;
+    try { await api.post('/delivery/location', { lat, lng }); }
+    catch { /* ignore */ }
+  }, []);
+
+  const requestAndStartLocationTracking = useCallback(() => {
+    if (!('geolocation' in navigator)) {
+      toast.error('Geolocalización no soportada en este navegador');
+      return;
+    }
+    localStorage.setItem('lubos_geo_permission', 'granted');
+    setGeoPermissionGranted(true);
+
+    if (watchIdRef.current !== null) return;
+
+    try {
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        (pos) => {
+          const { latitude, longitude } = pos.coords;
+          lastCoordsRef.current = { lat: latitude, lng: longitude };
+          sendLocation(latitude, longitude);
+        },
+        (err) => { console.warn('[Delivery] geolocation error:', err?.message || err); },
+        { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 }
+      );
+      toast.success('Ubicación guardada y activa para el delivery');
+    } catch (e) { console.warn('[Delivery] watchPosition failed:', e); }
+  }, [sendLocation]);
   const { unreadCount } = useNotifications();
   const userName = user?.name || (() => {
     try { return JSON.parse(localStorage.getItem('user') || '{}').name || ''; } catch { return ''; }
@@ -114,60 +152,46 @@ export default function DeliveryDashboard() {
     };
   }, [loadFast, loadDeliveryStats, loadSettings]);
 
-  // Comparte ubicacion cada 15s mientras el delivery este logueado.
-  // Best-effort en background: cuando el navegador reanuda la pestana se envia
-  // inmediatamente la ultima posicion conocida.
+  // Comparte ubicación de forma transparente si el permiso ya fue concedido previamente y guardado.
   useEffect(() => {
     if (!('geolocation' in navigator)) return;
-    let lastSent = 0;
-    let lastCoords = null;
-    let watchId = null;
-    const send = async (lat, lng) => {
-      const now = Date.now();
-      if (now - lastSent < 12000) return; // rate limit ~15s
-      lastSent = now;
-      try { await api.post('/delivery/location', { lat, lng }); }
-      catch (e) { /* silencio, se reintenta en la siguiente muestra */ }
-    };
-    try {
-      watchId = navigator.geolocation.watchPosition(
-        (pos) => {
-          const { latitude, longitude } = pos.coords;
-          lastCoords = { lat: latitude, lng: longitude };
-          send(latitude, longitude);
-        },
-        (err) => { console.warn('[Delivery] geolocation error:', err?.message || err); },
-        { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 },
-      );
-    } catch (e) { console.warn('[Delivery] watchPosition failed:', e); }
-    // Fuerza reenvio al volver a foreground.
+
+    const savedPerm = localStorage.getItem('lubos_geo_permission');
+    if (savedPerm === 'granted') {
+      requestAndStartLocationTracking();
+    } else if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'geolocation' }).then((res) => {
+        if (res.state === 'granted') {
+          requestAndStartLocationTracking();
+        }
+      }).catch(() => {});
+    }
+
+    // Fuerza reenvío de posición al volver a primer plano
     const onVisible = () => {
-      if (document.visibilityState === 'visible' && lastCoords) {
-        lastSent = 0;
-        send(lastCoords.lat, lastCoords.lng);
+      if (document.visibilityState === 'visible' && lastCoordsRef.current) {
+        lastSentRef.current = 0;
+        sendLocation(lastCoordsRef.current.lat, lastCoordsRef.current.lng);
       }
     };
     document.addEventListener('visibilitychange', onVisible);
-    // Fallback: si el navegador no dispara watchPosition, cada 15s intenta getCurrentPosition.
-    const fallback = setInterval(() => {
-      try {
-        navigator.geolocation.getCurrentPosition(
-          (pos) => {
-            const { latitude, longitude } = pos.coords;
-            lastCoords = { lat: latitude, lng: longitude };
-            send(latitude, longitude);
-          },
-          () => {},
-          { enableHighAccuracy: false, maximumAge: 30000, timeout: 15000 },
-        );
-      } catch { /* ignore */ }
+
+    // Re-envía las últimas coordenadas conocidas en segundo plano sin forzar re-solicitud al sistema operativo
+    const interval = setInterval(() => {
+      if (lastCoordsRef.current) {
+        sendLocation(lastCoordsRef.current.lat, lastCoordsRef.current.lng);
+      }
     }, 15000);
+
     return () => {
-      if (watchId != null) navigator.geolocation.clearWatch(watchId);
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
       document.removeEventListener('visibilitychange', onVisible);
-      clearInterval(fallback);
+      clearInterval(interval);
     };
-  }, []);
+  }, [requestAndStartLocationTracking, sendLocation]);
 
   const updateStatus = async (orderId, status) => {
     const prevOrder = (Array.isArray(orders) ? orders : []).find(o => o.id === orderId);
@@ -291,7 +315,6 @@ export default function DeliveryDashboard() {
   ];
 
   const releaseOrder = async (orderId) => {
-    if (!window.confirm('Devolver este pedido a Disponibles? Otro repartidor podra tomarlo.')) return;
     const targetOrder = (Array.isArray(orders) ? orders : []).find(o => o.id === orderId);
 
     // 0ms Optimistic UI update: move from orders -> availableOrders
@@ -427,6 +450,30 @@ export default function DeliveryDashboard() {
           </button>
         </div>
       </div>
+
+      {/* Banner de Permiso de Ubicación (Solo si no se ha concedido aún) */}
+      {!geoPermissionGranted && (
+        <div className="bg-amber-50 border border-amber-200/80 rounded-2xl p-3 px-4 flex items-center justify-between gap-3 shadow-xs" data-testid="geo-permission-banner">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 rounded-full bg-amber-100 text-amber-800 flex items-center justify-center shrink-0">
+              <Navigation className="h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs font-bold text-[#501122]">Permitir compartir ubicación</p>
+              <p className="text-[11px] text-[#78686C] truncate">Actívalo 1 sola vez para que los clientes y el panel puedan ver tu ruta en tiempo real.</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={requestAndStartLocationTracking}
+            className="shrink-0 px-4 py-2 rounded-full bg-[#501122] hover:bg-[#3D0C19] text-white text-xs font-bold active:scale-95 transition-all shadow-sm flex items-center gap-1.5"
+            data-testid="enable-gps-btn"
+          >
+            <Navigation className="h-3.5 w-3.5" />
+            <span>Activar GPS</span>
+          </button>
+        </div>
+      )}
 
       {/* DISPONIBLES - simplified: name + location + take button */}
       {activeSection === 'disponibles' && (
@@ -607,9 +654,24 @@ export default function DeliveryDashboard() {
                     </div>
 
                     <div className="flex flex-col items-end gap-1.5 shrink-0">
-                      <span className="inline-flex items-center gap-0.5 px-2.5 py-0.5 rounded-full bg-[#3F634A]/10 text-[#3F634A] border border-[#3F634A]/20 text-xs font-extrabold font-mono" title="Ganancia del delivery">
-                        {formatUSD(order.delivery_fee || 0)}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            releaseOrder(order.id);
+                          }}
+                          title="Devolver pedido a Disponibles"
+                          data-testid={`release-order-btn-${order.id}`}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-amber-500/10 hover:bg-amber-500/20 text-amber-800 border border-amber-500/30 text-xs font-bold transition-all active:scale-95"
+                        >
+                          <Undo2 className="h-3.5 w-3.5" />
+                          <span className="text-[10px] hidden sm:inline">Devolver</span>
+                        </button>
+                        <span className="inline-flex items-center gap-0.5 px-2.5 py-0.5 rounded-full bg-[#3F634A]/10 text-[#3F634A] border border-[#3F634A]/20 text-xs font-extrabold font-mono" title="Ganancia del delivery">
+                          {formatUSD(order.delivery_fee || 0)}
+                        </span>
+                      </div>
                       {locked
                         ? <Badge className="bg-[#78686C] text-white rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0">Bloqueado</Badge>
                         : <Badge className={`${statusColors[order.status]} rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0`}>{statusLabels[order.status]}</Badge>}
@@ -637,7 +699,9 @@ export default function DeliveryDashboard() {
                               onClick={(e) => {
                                 e.stopPropagation();
                                 const rDigits = (order.receiver_phone || '').replace(/[^0-9]/g, '');
-                                const msg = `*Delivery de Lubo's Tiramisu*\nHola un gusto, es ${userName}. Te envian un tiramisu, asi que ya voy saliendo para su ubicacion.\npara que estes pendiente\uD83E\uDD0E`;
+                                const g = (order.customer_gender || '').toUpperCase();
+                                const treat = (g === 'F' || g === 'MUJER') ? ' querida' : ((g === 'M' || g === 'HOMBRE') ? ' hermano' : '');
+                                const msg = `*Delivery de Lubo's Tiramisu*\nPedido de ${order.customer_name || ''}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicación para que estes pendiente🤎`;
                                 window.open(`https://wa.me/${rDigits}?text=${encodeURIComponent(msg)}`, '_blank');
                               }}
                               data-testid={`mine-receiver-wa-${order.id}`}
@@ -659,13 +723,9 @@ export default function DeliveryDashboard() {
                       onClick={() => {
                         const targetPhone = order.receiver_phone || order.customer_phone || '';
                         const pDigits = targetPhone.replace(/[^0-9]/g, '');
-                        const g = order.customer_gender;
-                        const treat = g === 'F' ? ' querida' : (g === 'M' ? ' hermano' : '');
-                        const isReceiver = !!order.receiver_phone && !!order.receiver_name;
-                        const nameToUse = isReceiver ? order.receiver_name : order.customer_name;
-                        const msg = isReceiver
-                          ? `*Delivery de Lubo's Tiramisu*\nHola ${nameToUse}, te envían un tiramisú de Lubo's. Es ${userName}, ya voy saliendo para tu ubicación para que estés pendiente 🛵`
-                          : `*Delivery de Lubo's Tiramisu*\nPedido de ${order.customer_name}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicación para que estés pendiente 🛵`;
+                        const g = (order.customer_gender || '').toUpperCase();
+                        const treat = (g === 'F' || g === 'MUJER') ? ' querida' : ((g === 'M' || g === 'HOMBRE') ? ' hermano' : '');
+                        const msg = `*Delivery de Lubo's Tiramisu*\nPedido de ${order.customer_name || ''}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicación para que estes pendiente🤎`;
                         window.open(`https://wa.me/${pDigits}?text=${encodeURIComponent(msg)}`, '_blank');
                       }}
                       data-testid={`notify-client-btn-${order.id}`}
@@ -1040,7 +1100,9 @@ export default function DeliveryDashboard() {
                       type="button"
                       onClick={() => {
                         const rDigits = (currentRouteOrder.receiver_phone || '').replace(/[^0-9]/g, '');
-                        const msg = `*Delivery de Lubo's Tiramisu*\nHola ${currentRouteOrder.receiver_name || ''}, te envían un tiramisú de Lubo's. Es ${userName}, ya voy en camino a la ubicación 🛵`;
+                        const g = (currentRouteOrder.customer_gender || '').toUpperCase();
+                        const treat = (g === 'F' || g === 'MUJER') ? ' querida' : ((g === 'M' || g === 'HOMBRE') ? ' hermano' : '');
+                        const msg = `*Delivery de Lubo's Tiramisu*\nPedido de ${currentRouteOrder.customer_name || ''}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicación para que estes pendiente🤎`;
                         window.open(`https://wa.me/${rDigits}?text=${encodeURIComponent(msg)}`, '_blank');
                       }}
                       className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#25D366] text-white text-[11px] font-bold active:scale-95 shadow-sm"
@@ -1067,10 +1129,7 @@ export default function DeliveryDashboard() {
                   onClick={() => {
                     const targetPhone = currentRouteOrder.receiver_phone || currentRouteOrder.customer_phone || '';
                     const digits = targetPhone.replace(/[^0-9]/g, '');
-                    const nameToUse = (currentRouteOrder.receiver_phone && currentRouteOrder.receiver_name)
-                      ? currentRouteOrder.receiver_name
-                      : currentRouteOrder.customer_name;
-                    const msg = `*Delivery de Lubo's Tiramisu*\nHola ${nameToUse}, ¡ya estoy abajo con tu pedido! 🧁`;
+                    const msg = `Listo ya estoy acá🤎`;
                     window.open(`https://wa.me/${digits}?text=${encodeURIComponent(msg)}`, '_blank');
                   }}
                   data-testid="route-modal-notify-arrived-btn"

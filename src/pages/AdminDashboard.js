@@ -90,9 +90,25 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const [settings, setSettings] = useState({ exchange_rate_ves: 36.5 });
   const [dateFrom, setDateFrom] = useState(null);
   const [dateTo, setDateTo] = useState(null);
-  const [statusFilter, setStatusFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState(['all']);
+
+  const toggleStatusFilter = (id) => {
+    if (id === 'all') {
+      setStatusFilter(['all']);
+    } else {
+      setStatusFilter(prev => {
+        const withoutAll = prev.filter(x => x !== 'all');
+        if (withoutAll.includes(id)) {
+          const next = withoutAll.filter(x => x !== id);
+          return next.length === 0 ? ['all'] : next;
+        } else {
+          return [...withoutAll, id];
+        }
+      });
+    }
+  };
   const [typeFilter, setTypeFilter] = useState('all'); // 'all' | 'delivery' | 'pickup'
-  const [pedidosLimit, setPedidosLimit] = useState(10);
+  const [pedidosLimit, setPedidosLimit] = useState(20);
 
   const STATUS_CHIPS = [
     { id: 'all', label: 'Todos', icon: Layers, cls: 'bg-[#501122] text-white' },
@@ -170,11 +186,14 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
     const cStats = getLocalCache('admin_stats');
     if (cStats) setStats(cStats);
     const cOrders = getLocalCache('admin_orders');
-    if (cOrders && !statusFilter && !dateFrom && !dateTo) setOrders(cOrders);
+    const isAllStatus = !statusFilter || statusFilter.includes('all') || statusFilter.length === 0;
+    if (cOrders && isAllStatus && !dateFrom && !dateTo) setOrders(cOrders);
 
     try {
       const orderParams = {};
-      if (statusFilter && statusFilter !== 'all') orderParams.status = statusFilter;
+      if (statusFilter && !isAllStatus) {
+        orderParams.status = statusFilter.join(',');
+      }
       if (dateFrom) orderParams.date_from = dateFrom.toISOString().split('T')[0];
       if (dateTo) orderParams.date_to = dateTo.toISOString().split('T')[0];
       const [st, ord, locs] = await Promise.all([
@@ -185,7 +204,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
       setStats(st.data);
       setLocalCache('admin_stats', st.data);
       setOrders(ord.data);
-      if (!statusFilter && !dateFrom && !dateTo) setLocalCache('admin_orders', ord.data);
+      if (isAllStatus && !dateFrom && !dateTo) setLocalCache('admin_orders', ord.data);
       setDeliveryLocations(locs.data || []);
     } catch { /* silencio en polling */ }
   }, [statusFilter, dateFrom, dateTo]);
@@ -220,7 +239,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   useEffect(() => {
     loadFast();
     loadSlow();
-    const interval = setInterval(loadFast, 15000);
+    const interval = setInterval(loadFast, 10000);
     const onVisible = () => { if (document.visibilityState === 'visible') loadFast(); };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', loadFast);
@@ -241,16 +260,38 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   }, [loadFast, loadSlow]);
 
   const loadClientStats = useCallback(async () => {
+    const cached = getLocalCache('admin_client_stats');
+    if (cached) setClientStats(cached);
+
     setLoadingClientStats(true);
     try {
       const params = clientPeriod !== 'all' ? { period: clientPeriod } : {};
       const { data } = await api.get('/dashboard/client-stats', { params });
       setClientStats(data);
+      setLocalCache('admin_client_stats', data);
     } catch { toast.error('Error cargando estadisticas'); }
     setLoadingClientStats(false);
   }, [clientPeriod]);
 
-  useEffect(() => { if (activeSection === 'clientes') loadClientStats(); }, [activeSection, loadClientStats]);
+  useEffect(() => {
+    if (activeSection === 'clientes') {
+      loadClientStats();
+    }
+  }, [activeSection, loadClientStats]);
+
+  useEffect(() => {
+    const handleSync = () => {
+      if (activeSection === 'clientes') {
+        loadClientStats();
+      }
+    };
+    window.addEventListener('lubos:customers-changed', handleSync);
+    window.addEventListener('lubos:orders-changed', handleSync);
+    return () => {
+      window.removeEventListener('lubos:customers-changed', handleSync);
+      window.removeEventListener('lubos:orders-changed', handleSync);
+    };
+  }, [activeSection, loadClientStats]);
 
   const loadReport = useCallback(async () => {
     setLoadingReport(true);
@@ -478,6 +519,8 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
       await api.delete(`/customers/${clientId}`);
       toast.success('Cliente eliminado');
       setShowClientDialog(false);
+      notifyLocalChange('customers_changed');
+      notifyLocalChange('orders_changed');
       loadClientStats();
       loadAll();
     } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
@@ -514,6 +557,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
         toast.success('Cliente creado');
       }
       setShowCustomerForm(false);
+      notifyLocalChange('customers_changed');
       loadClientStats();
       loadAll();
     } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
@@ -641,9 +685,12 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
     { id: 'widgets', icon: Code2, label: 'Widgets' },
   ];
 
-  const filteredClients = clientStats?.customers?.filter(c =>
-    fuzzyMatch(c.name || '', clientSearch) || (c.phone || '').includes(clientSearch)
-  ) || [];
+  const filteredClients = clientStats?.customers?.filter(c => {
+    const rawPhone = c.phone || '';
+    const digitsOnly = rawPhone.replace(/[^0-9]/g, '');
+    const combinedText = `${c.name || ''} ${rawPhone} ${digitsOnly}`;
+    return fuzzyMatch(combinedText, clientSearch);
+  }) || [];
 
   // Memoized derived collections to avoid re-filtering on every render
   const safeOrdersList = Array.isArray(orders) ? orders : [];
@@ -1520,11 +1567,11 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
             <div className="flex items-center gap-2 flex-wrap min-w-0">
               <div className="flex flex-wrap gap-1.5" data-testid="status-chips">
                 {STATUS_CHIPS.map(s => {
-                  const active = statusFilter === s.id;
+                  const active = Array.isArray(statusFilter) ? statusFilter.includes(s.id) : statusFilter === s.id;
                   const visibleCount = (Array.isArray(orders) ? orders : []).filter(o => o.status !== 'sin_pagar').length;
                   const Icon = s.icon;
                   return (
-                  <button key={s.id} onClick={() => setStatusFilter(s.id)} data-testid={`chip-${s.id}`}
+                  <button key={s.id} onClick={() => toggleStatusFilter(s.id)} data-testid={`chip-${s.id}`}
                     title={s.label}
                     className={`h-10 w-10 rounded-full flex items-center justify-center transition-all relative
                       ${active ? s.cls + ' shadow-md scale-105' : 'bg-white text-[#78686C] border border-[#501122]/10 hover:border-[#501122]/30'}`}>
@@ -1573,15 +1620,14 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                     cancelado: 'bg-gradient-to-l from-red-400/25 via-white to-white',
                   }[o.status] || '';
                   return (
-                  <div key={o.id} className={`p-5 flex flex-col md:flex-row md:items-center gap-3 md:gap-5 relative ${gradientClass} ${o.order_type === 'pickup' ? 'border-l-4 border-amber-400' : ''}`}>
+                  <div key={o.id} className={`p-3 px-4 flex flex-col md:flex-row md:items-center gap-2 md:gap-4 relative ${gradientClass} ${o.order_type === 'pickup' ? 'border-l-4 border-amber-400' : ''}`}>
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1 flex-wrap">
-                        <span className="text-[10px] font-mono text-[#78686C]">{o.order_number}</span>
-                        <Badge className={`${statusColors[o.status]} rounded-full px-2.5 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 pointer-events-none hover:bg-current/0`}>{statusLabels[o.status]}</Badge>
-                        {o.order_type === 'pickup' && <Badge className="bg-[#C27A29]/15 text-[#C27A29] rounded-full px-2.5 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 pointer-events-none"><ShoppingBag className="h-2.5 w-2.5 inline mr-0.5" />Pickup</Badge>}
-                        {o.created_by_name && <span className="text-[10px] text-[#78686C]">por <span className="font-semibold text-[#501122]">{o.created_by_name}</span></span>}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-heading text-[#501122] text-sm font-bold truncate">{o.customer_name}</span>
+                        <Badge className={`${statusColors[o.status]} rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 pointer-events-none hover:bg-current/0 shrink-0`}>{statusLabels[o.status]}</Badge>
+                        {o.order_type === 'pickup' && <Badge className="bg-[#C27A29]/15 text-[#C27A29] rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 pointer-events-none shrink-0"><ShoppingBag className="h-2.5 w-2.5 inline mr-0.5" />Pickup</Badge>}
+                        {o.created_by_name && <span className="text-[10px] text-[#78686C] shrink-0">por <span className="font-semibold text-[#501122]">{o.created_by_name}</span></span>}
                       </div>
-                      <p className="font-heading text-[#501122] text-sm">{o.customer_name}</p>
                       {o.wait_for_notice && (
                         <p className="text-[11px] font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1 mt-0.5" data-testid={`order-wait-notice-sublabel-${o.id}`}>
                           <Hourglass className="h-3 w-3 shrink-0 text-gray-500" />
@@ -1590,28 +1636,28 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                       )}
                       <p className="text-xs text-[#78686C] mt-0.5">{o.items?.map(i => `${i.flavor_name} x${i.quantity}`).join(', ')}</p>
                       {(o.notes || o.scheduled_for || o.wait_for_notice || o.velitas || o.receiver_name || o.receiver_phone) && (
-                        <div className="mt-1.5 flex flex-wrap gap-1.5" data-testid={`order-meta-${o.id}`}>
+                        <div className="mt-1 flex flex-wrap gap-1" data-testid={`order-meta-${o.id}`}>
                           {o.wait_for_notice && (
-                            <span className="text-[11px] text-gray-700 bg-gray-200/90 border border-gray-300/60 rounded-lg px-2 py-0.5 inline-flex items-center gap-1" title="Esperar aviso del cliente" data-testid={`order-wait-notice-meta-${o.id}`}>
+                            <span className="text-[10px] text-gray-700 bg-gray-200/90 border border-gray-300/60 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Esperar aviso del cliente" data-testid={`order-wait-notice-meta-${o.id}`}>
                               <Hourglass className="h-3 w-3 shrink-0" />
                               <span className="font-bold">esperar aviso</span>
                             </span>
                           )}
                           {o.scheduled_for && (
-                            <span className="text-[11px] text-[#501122] bg-[#F3EBE0]/80 rounded-lg px-2 py-1 inline-flex items-center gap-1" title="Pedido programado" data-testid={`order-scheduled-${o.id}`}>
+                            <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Pedido programado" data-testid={`order-scheduled-${o.id}`}>
                               <CalendarClock className="h-3 w-3 shrink-0" />
                               <span className="font-semibold">Programado:</span>
                               <span>{formatDate(o.scheduled_for)}</span>
                             </span>
                           )}
                           {o.velitas && (
-                            <span className="text-[11px] text-[#C27A29] bg-[#C27A29]/10 rounded-lg px-2 py-1 inline-flex items-center gap-1" title="Requiere velitas" data-testid={`order-velitas-${o.id}`}>
+                            <span className="text-[10px] text-[#C27A29] bg-[#C27A29]/10 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Requiere velitas" data-testid={`order-velitas-${o.id}`}>
                               <Cake className="h-3 w-3 shrink-0" />
                               <span className="font-semibold">Con velitas</span>
                             </span>
                           )}
                           {(o.receiver_name || o.receiver_phone) && (
-                            <span className="text-[11px] text-[#501122] bg-[#F3EBE0]/80 rounded-lg px-2 py-1 inline-flex items-center gap-1 max-w-full" title="Recibe otra persona" data-testid={`order-receiver-${o.id}`}>
+                            <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1 max-w-full" title="Recibe otra persona" data-testid={`order-receiver-${o.id}`}>
                               <UserRound className="h-3 w-3 shrink-0" />
                               <span className="font-semibold">Recibe:</span>
                               <span className="break-words">
@@ -1622,7 +1668,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                             </span>
                           )}
                           {o.notes && (
-                            <span className="text-[11px] text-[#501122] bg-[#F3EBE0]/80 rounded-lg px-2 py-1 inline-flex items-start gap-1 max-w-full" data-testid={`order-notes-${o.id}`}>
+                            <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-start gap-1 max-w-full" data-testid={`order-notes-${o.id}`}>
                               <FileText className="h-3 w-3 mt-0.5 shrink-0" />
                               <span className="break-words">{o.notes}</span>
                             </span>
@@ -1630,13 +1676,13 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                         </div>
                       )}
                     </div>
-                    <div className="flex items-center gap-4 md:gap-6 shrink-0">
-                      <div className="text-right text-[10px] space-y-0.5 relative">
+                    <div className="flex items-center gap-3 md:gap-4 shrink-0">
+                      <div className="text-right text-[10px] space-y-0 relative">
                         <p><span className="text-[#78686C]">Producto:</span> <span className="font-semibold text-[#501122]">{formatUSD(o.items_total || 0)}</span> <span className="text-[#78686C]">/ {formatVES(o.items_total || 0, rate)}</span></p>
                         {o.order_type !== 'pickup' && o.delivery_fee > 0 && (
                           <p><span className="text-[#78686C]">Delivery:</span> <span className="font-semibold text-[#3F634A]">{formatUSD(o.delivery_fee || 0)}</span> <span className="text-[#78686C]">/ {formatVES(o.delivery_fee || 0, rate)}</span></p>
                         )}
-                        <p className="pt-1 border-t border-[#501122]/10">
+                        <p className="pt-0.5 border-t border-[#501122]/10">
                           <span className="text-[#78686C] font-semibold">Total:</span> <span className="font-heading text-[#501122] text-sm">{formatUSD(o.total_usd)}</span> <span className="text-[#78686C]">/ {formatVES(o.total_usd, rate)}</span>
                         </p>
                       </div>
@@ -1646,10 +1692,10 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                             <PopoverTrigger asChild>
                               <button type="button" className="flex items-center gap-2 rounded-full hover:bg-[#F3EBE0]/60 transition-colors px-1 py-1" data-testid={`assign-delivery-btn-${o.id}`} title={o.delivery_id ? 'Cambiar delivery' : 'Asignar delivery'}>
                                 {o.delivery_id ? (
-                                  <Avatar src={o.delivery_photo_url} name={o.delivery_name} size={48} testId={`order-delivery-avatar-${o.id}`} />
+                                  <Avatar src={o.delivery_photo_url} name={o.delivery_name} size={38} testId={`order-delivery-avatar-${o.id}`} />
                                 ) : (
-                                  <div className="w-12 h-12 rounded-full border-2 border-dashed border-[#501122]/30 flex items-center justify-center text-[#501122]/50">
-                                    <Truck className="h-5 w-5" />
+                                  <div className="w-9 h-9 rounded-full border-2 border-dashed border-[#501122]/30 flex items-center justify-center text-[#501122]/50">
+                                    <Truck className="h-4 w-4" />
                                   </div>
                                 )}
                                 <div className="text-right">
@@ -1832,7 +1878,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                 {filteredClients.map(c => (
                   <div key={c.id} className="p-5 flex items-center gap-4 cursor-pointer hover:bg-[#501122]/[0.02] transition-colors" onClick={() => openClientHistory(c)} data-testid={`client-row-${c.id}`}>
                     <div className="flex-1 min-w-0"><p className="font-heading text-[#501122] text-sm">{c.name}</p><p className="text-xs text-[#78686C] flex items-center gap-1.5 mt-0.5"><Phone className="h-3 w-3" />{c.phone}</p></div>
-                    <Badge className="bg-[#F3EBE0] text-[#501122] rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-wider border-0">{c.order_count || 0} entregados</Badge>
+                    <Badge onClick={(e) => { e.stopPropagation(); openClientHistory(c); }} className="bg-[#F3EBE0] text-[#501122] hover:bg-[#501122] hover:text-white transition-colors cursor-pointer rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-wider border-0" data-testid={`client-delivered-badge-${c.id}`}>{c.order_count || 0} entregados</Badge>
                     <button onClick={(e) => { e.stopPropagation(); openEditCustomer(c); }} className="w-9 h-9 rounded-full bg-[#F3EBE0] flex items-center justify-center text-[#501122] hover:bg-[#501122] hover:text-white transition-all active:scale-90 shrink-0" data-testid={`client-edit-${c.id}`}><Pencil className="h-3.5 w-3.5" /></button>
                     {isAdmin && <button onClick={(e) => { e.stopPropagation(); deleteClient(c.id); }} className="w-9 h-9 rounded-full bg-red-50 flex items-center justify-center text-red-500 hover:bg-red-500 hover:text-white transition-all active:scale-90 shrink-0" data-testid={`client-delete-${c.id}`}><Trash2 className="h-3.5 w-3.5" /></button>}
                     <a href={`https://wa.me/${(c.phone || '').replace(/[^0-9]/g, '')}`} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="w-9 h-9 rounded-full bg-[#25D366] flex items-center justify-center hover:bg-[#1da851] transition-all active:scale-90 shrink-0" data-testid={`client-wa-${c.id}`}><MessageCircle className="h-4 w-4 text-white" /></a>
@@ -1852,7 +1898,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                     <a href={`https://wa.me/${(selectedClient.phone || '').replace(/[^0-9]/g, '')}`} target="_blank" rel="noopener noreferrer" className="w-8 h-8 rounded-full bg-[#25D366] flex items-center justify-center hover:bg-[#1da851] transition-all ml-auto"><MessageCircle className="h-4 w-4 text-white" /></a>
                   </div>
                   <div className="flex gap-3">
-                    <div className="bg-[#F3EBE0] rounded-2xl p-3 flex-1 text-center"><p className="font-heading text-xl text-[#501122]">{selectedClient.order_count || 0}</p><p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Entregados</p></div>
+                    <div className="bg-[#F3EBE0] rounded-2xl p-3 flex-1 text-center"><p className="font-heading text-xl text-[#501122]">{clientHistory.filter(o => o.status === 'entregado').length || selectedClient.order_count || 0}</p><p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Entregados</p></div>
                     <div className="bg-[#F3EBE0] rounded-2xl p-3 flex-1 text-center"><p className="font-heading text-xl text-[#501122]">{formatUSD(clientHistory.filter(o => o.status === 'entregado').reduce((s, o) => s + (o.total_usd || 0), 0))}</p><p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Total gastado</p></div>
                   </div>
                   <div className="border-t border-[#501122]/10 pt-4">

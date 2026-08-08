@@ -154,12 +154,17 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
   }, [mapInstance, showRoute, routeDestLat, routeDestLng, cpLat, cpLng]);
 
   // "Encuadrar" (fit-all) — bumped by parent to reframe the map to include every
-  // order pin plus the store. No-op when called with 0 (initial mount).
+  // order pin plus the store and live delivery driver locations. No-op when called with 0 (initial mount).
   useEffect(() => {
     if (!mapInstance || fitAllRequestId <= 0 || !window.google?.maps) return;
     const pts = [];
     if (hasCentral) pts.push({ lat: centralPoint.lat, lng: centralPoint.lng });
     orderPoints.forEach(o => pts.push({ lat: o.lat, lng: o.lng }));
+    (deliveryLocations || []).forEach(d => {
+      if (typeof d.lat === 'number' && typeof d.lng === 'number') {
+        pts.push({ lat: d.lat, lng: d.lng });
+      }
+    });
     if (pts.length === 0) return;
     if (pts.length === 1) {
       mapInstance.panTo(pts[0]);
@@ -171,7 +176,7 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
       pts.forEach(p => bounds.extend(p));
       mapInstance.fitBounds(bounds, 80);
     } catch { /* ignore */ }
-  }, [fitAllRequestId, mapInstance, hasCentral, centralPoint, orderPoints]);
+  }, [fitAllRequestId, mapInstance, hasCentral, centralPoint, orderPoints, deliveryLocations]);
 
   return (
     <GoogleMap
@@ -370,8 +375,13 @@ function DeliveryMapInner({ isLoaded, loadError, orders, title = 'Mapa de Entreg
     [visibleOrders]
   );
 
+  const activeDeliveriesCount = useMemo(
+    () => (deliveryLocations || []).filter(d => typeof d.lat === 'number' && typeof d.lng === 'number').length,
+    [deliveryLocations]
+  );
+
   const hasCentral = centralPoint && typeof centralPoint.lat === 'number' && typeof centralPoint.lng === 'number';
-  const showMap = validCount > 0 || hasCentral;
+  const showMap = validCount > 0 || activeDeliveriesCount > 0 || hasCentral;
 
   // JS-based resizable wrapper (CSS `resize` is not supported on divs in Safari).
   // Users can drag the bottom edge/handle to grow the map up to viewport height.
@@ -456,7 +466,7 @@ function DeliveryMapInner({ isLoaded, loadError, orders, title = 'Mapa de Entreg
               type="button"
               onClick={() => setFitAllRequestId(id => id + 1)}
               data-testid={`${testId}-fit-all-btn`}
-              title="Encuadrar la tienda y todos los pedidos"
+              title="Encuadrar la tienda, pedidos por entregar y repartidores"
               className="absolute left-1/2 -translate-x-1/2 bottom-5 z-10 flex items-center gap-2 px-5 h-10 rounded-full bg-[#501122] hover:bg-[#3D0C19] text-white text-xs font-bold uppercase tracking-wider shadow-lg active:scale-95 transition-all"
             >
               <Frame className="h-4 w-4" />

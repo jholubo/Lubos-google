@@ -196,7 +196,17 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
     } catch (e) { console.warn('[OrderForm] data load failed:', e?.message || e); }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+    window.addEventListener('lubos:customers-changed', loadData);
+    window.addEventListener('lubos:flavors-changed', loadData);
+    window.addEventListener('lubos:settings-changed', loadData);
+    return () => {
+      window.removeEventListener('lubos:customers-changed', loadData);
+      window.removeEventListener('lubos:flavors-changed', loadData);
+      window.removeEventListener('lubos:settings-changed', loadData);
+    };
+  }, [loadData]);
 
   // Debounced customer search: refetch server-side when user types
   useEffect(() => {
@@ -319,6 +329,7 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
       toast.success('Cliente creado');
       setNewCustName(''); setNewCustPhone(''); setNewCustGender(null);
       setShowCustomerDialog(false);
+      notifyLocalChange('customers_changed');
       await loadData();
       setSelectedCustomerId(data.id);
       setIsQuote(false); // auto-desmarcar cotizacion al crear un cliente nuevo desde aqui

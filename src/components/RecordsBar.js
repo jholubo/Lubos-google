@@ -119,83 +119,58 @@ export default function RecordsBar({ collapsed = false }) {
     );
   }
 
-  // Expanded Sidebar View: Premium Brand Card for Sales Records
+  // Expanded Sidebar View: Clean, minimal & compact card for Sales Records
   return (
-    <div className="w-full flex flex-col gap-2.5 p-3 rounded-2xl bg-gradient-to-b from-[#501122]/[0.04] to-[#501122]/[0.01] border border-[#501122]/12 shadow-2xs" data-testid="records-bar">
-      <div className="flex items-center justify-between text-[10px] font-extrabold text-[#501122] uppercase tracking-wider pb-1.5 border-b border-[#501122]/10">
+    <div className="w-full flex flex-col gap-2 p-2.5 rounded-2xl bg-[#501122]/[0.03] border border-[#501122]/10" data-testid="records-bar">
+      <div className="flex items-center justify-between text-xs font-bold text-[#501122]">
         <span className="flex items-center gap-1.5">
           <Trophy className="h-3.5 w-3.5 text-[#C27A29]" />
           Récords de Ventas
         </span>
-        <span className="text-[9px] font-bold text-[#78686C] bg-[#501122]/5 px-1.5 py-0.5 rounded">USD</span>
       </div>
 
-      {/* Daily Record */}
+      {/* Hoy */}
       <div className="space-y-1" data-testid="record-daily">
-        <div className="flex items-center justify-between text-xs">
-          <span className="font-bold text-[#501122] flex items-center gap-1">
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="font-semibold text-[#501122] flex items-center gap-1">
             Hoy
-            {dailyBroken ? (
-              <span className="text-[8px] bg-amber-100 text-amber-800 border border-amber-300/60 px-1.5 py-0.2 rounded-full font-extrabold animate-pulse">
-                🏆 ¡Superado!
-              </span>
-            ) : (
-              <span className="text-[9px] bg-[#C27A29]/10 text-[#C27A29] px-1.5 py-0.2 rounded-md font-extrabold">
-                {Math.round(dailyPct)}%
-              </span>
+            {dailyBroken && (
+              <span className="text-[9px] font-bold text-amber-600">🏆</span>
             )}
           </span>
-          <div className="text-right">
-            <span className="font-extrabold text-[#1F1517] text-xs tabular-nums">
-              {formatUSD(today.revenue)}
-            </span>
-            <span className="text-[10px] text-[#78686C] font-semibold tabular-nums ml-1">
-              / {today.record > 0 ? formatUSD(today.record) : '--'}
-            </span>
-          </div>
+          <span className="font-bold text-[#1F1517] tabular-nums">
+            {formatUSD(today.revenue)}
+            <span className="text-[10px] text-[#78686C] font-normal"> / {today.record > 0 ? formatUSD(today.record) : '--'}</span>
+          </span>
         </div>
-        <div className="w-full h-2 bg-[#501122]/10 rounded-full overflow-hidden p-0.5">
+        <div className="w-full h-1.5 bg-[#501122]/10 rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-500 ${
-              dailyBroken
-                ? 'bg-gradient-to-r from-amber-400 to-amber-600 animate-pulse shadow-[0_0_10px_rgba(217,138,50,0.8)]'
-                : 'bg-gradient-to-r from-amber-500 to-[#C27A29]'
+              dailyBroken ? 'bg-amber-500 animate-pulse' : 'bg-[#C27A29]'
             }`}
             style={{ width: `${dailyPct}%` }}
           />
         </div>
       </div>
 
-      {/* Monthly Record */}
+      {/* Mes */}
       <div className="space-y-1" data-testid="record-monthly">
-        <div className="flex items-center justify-between text-xs">
-          <span className="font-bold text-[#501122] flex items-center gap-1">
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="font-semibold text-[#501122] flex items-center gap-1">
             Mes
-            {monthlyBroken ? (
-              <span className="text-[8px] bg-purple-100 text-purple-800 border border-purple-300/60 px-1.5 py-0.2 rounded-full font-extrabold animate-pulse">
-                🏆 ¡Superado!
-              </span>
-            ) : (
-              <span className="text-[9px] bg-[#501122]/10 text-[#501122] px-1.5 py-0.2 rounded-md font-extrabold">
-                {Math.round(monthlyPct)}%
-              </span>
+            {monthlyBroken && (
+              <span className="text-[9px] font-bold text-purple-600">🏆</span>
             )}
           </span>
-          <div className="text-right">
-            <span className="font-extrabold text-[#1F1517] text-xs tabular-nums">
-              {formatUSD(month.revenue)}
-            </span>
-            <span className="text-[10px] text-[#78686C] font-semibold tabular-nums ml-1">
-              / {month.is_first_month ? 'definiendo' : formatUSD(month.record)}
-            </span>
-          </div>
+          <span className="font-bold text-[#1F1517] tabular-nums">
+            {formatUSD(month.revenue)}
+            <span className="text-[10px] text-[#78686C] font-normal"> / {month.is_first_month ? '---' : formatUSD(month.record)}</span>
+          </span>
         </div>
-        <div className="w-full h-2 bg-[#501122]/10 rounded-full overflow-hidden p-0.5">
+        <div className="w-full h-1.5 bg-[#501122]/10 rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-500 ${
-              monthlyBroken
-                ? 'bg-gradient-to-r from-[#701C33] to-[#A0284A] animate-pulse shadow-[0_0_10px_rgba(80,17,34,0.8)]'
-                : 'bg-gradient-to-r from-[#501122] to-[#701C33]'
+              monthlyBroken ? 'bg-[#501122] animate-pulse' : 'bg-[#501122]/80'
             }`}
             style={{ width: `${monthlyPct}%` }}
           />

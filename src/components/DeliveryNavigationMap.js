@@ -65,18 +65,11 @@ function DeliveryNavigationMapInner({
       setGeoError('Permiso de ubicación denegado o no disponible');
     };
 
-    // Initial position fetch
-    navigator.geolocation.getCurrentPosition(handleSuccess, handleError, {
-      enableHighAccuracy: true,
-      timeout: 10000,
-      maximumAge: 3000,
-    });
-
     // Watch position continuous updates
     const watchId = navigator.geolocation.watchPosition(handleSuccess, handleError, {
       enableHighAccuracy: true,
       timeout: 10000,
-      maximumAge: 3000,
+      maximumAge: 10000,
     });
 
     return () => {
