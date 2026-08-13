@@ -129,7 +129,7 @@ export default function WidgetsSection({ widgetSettings, setWidgetSettings, avai
             <p className="text-[11px] font-bold text-[#501122] mb-1">B. Clase por sabor (atenuar la tarjeta cuando se agote)</p>
             <p className="text-[11px] text-[#78686C] mb-2">Cuando un sabor llega a 0, el widget inyecta una regla CSS con la version slugificada del nombre. Asigna esa clase al contenedor (card) del producto:</p>
             <div className="bg-[#F3EBE0] rounded-2xl p-3 space-y-1.5 font-mono text-[11px]">
-              {availableFlavors.map(f => (
+              {(availableFlavors || []).map(f => (
                 <div key={f.id} className="flex items-center justify-between gap-3">
                   <span className="text-[#78686C]">{f.name}</span>
                   <span className="text-[#501122] font-bold">.{slugify(f.name)}</span>

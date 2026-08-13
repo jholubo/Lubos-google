@@ -50,7 +50,7 @@ function App() {
           <Route path="*" element={<RoleRedirect />} />
         </Routes>
       </BrowserRouter>
-      <Toaster richColors position="top-right" />
+      <Toaster position="top-center" duration={3000} />
     </AuthProvider>
   );
 }

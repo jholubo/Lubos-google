@@ -1,1 +1,70 @@
-/* Lubo's custom styles */
+/* Lubo's custom styles for compact top-center toasts */
+
+[data-sonner-toaster] {
+  position: fixed !important;
+  top: 16px !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  width: auto !important;
+  max-width: calc(100vw - 32px) !important;
+  z-index: 99999 !important;
+  pointer-events: none;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+}
+
+[data-sonner-toast] {
+  pointer-events: auto !important;
+  padding: 8px 16px !important;
+  border-radius: 9999px !important;
+  font-size: 12px !important;
+  line-height: 1.4 !important;
+  width: auto !important;
+  max-width: min(90vw, 420px) !important;
+  min-width: max-content !important;
+  background: #501122 !important;
+  color: #ffffff !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2) !important;
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 8px !important;
+  white-space: normal !important;
+  word-break: normal !important;
+  overflow-wrap: break-word !important;
+}
+
+[data-sonner-toast] [data-content] {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: flex-start !important;
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+}
+
+[data-sonner-toast] [data-title] {
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  color: #ffffff !important;
+  white-space: normal !important;
+  word-break: normal !important;
+  text-align: left !important;
+}
+
+[data-sonner-toast] [data-description] {
+  font-size: 11px !important;
+  color: rgba(255, 255, 255, 0.8) !important;
+  margin-top: 1px !important;
+  white-space: normal !important;
+  word-break: normal !important;
+}
+
+[data-sonner-toast] [data-close-button] {
+  background: rgba(255, 255, 255, 0.15) !important;
+  color: #ffffff !important;
+  border: none !important;
+  border-radius: 9999px !important;
+}

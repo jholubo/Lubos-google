@@ -39,8 +39,8 @@ function SalesHeatmapInner({ isLoaded, loadError }) {
         api.get('/orders/heatmap', { params }),
         api.get('/zones'),
       ]);
-      setPoints(hm.data.points || []);
-      setZones(zn.data || []);
+      setPoints(hm.data?.points || []);
+      setZones(Array.isArray(zn.data) ? zn.data : []);
     } catch { toast.error('Error cargando mapa'); }
     setLoading(false);
   }, [preset]);

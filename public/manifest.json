@@ -1,12 +1,26 @@
 {
   "short_name": "Lubo's",
   "name": "Lubo's Tiramisú - Gestión",
+  "description": "Sistema de Gestión y Logística de Lubo's Tiramisú",
   "icons": [
-    { "src": "/isotipo.webp", "sizes": "any", "type": "image/webp", "purpose": "any" }
+    {
+      "src": "/isotipo.webp",
+      "sizes": "192x192 512x512",
+      "type": "image/webp",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/isotipo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
   ],
   "start_url": "/",
   "display": "standalone",
   "theme_color": "#501122",
   "background_color": "#FBF7F0",
-  "orientation": "portrait"
+  "orientation": "portrait",
+  "categories": ["business", "food", "productivity"]
 }
+

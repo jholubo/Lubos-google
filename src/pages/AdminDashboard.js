@@ -3,6 +3,7 @@ import { useBackButtonClose } from '@/hooks/useBackButtonClose';
 import { toast } from 'sonner';
 import api, { formatUSD, formatVES } from '@/lib/api';
 import { getLocalCache, setLocalCache } from '@/lib/cache';
+import { getStoredCentralPoint, syncCentralPointWithBackend } from '@/lib/centralPoint';
 import { notifyLocalChange } from '@/lib/dataSync';
 import { useNotifications, playNotificationSound } from '@/hooks/useNotifications';
 import usePushSubscription from '@/hooks/usePushSubscription';
@@ -18,10 +19,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Calendar } from '@/components/ui/calendar';
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Popover, PopoverContent, PopoverTrigger, PopoverClose } from '@/components/ui/popover';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LabelList } from 'recharts';
-import { LayoutDashboard, ShoppingBag, IceCream2, Users, Settings, Plus, Pencil, Trash2, CalendarDays, DollarSign, Package, TrendingUp, RefreshCw, Loader2, UserCheck, Phone, MessageCircle, Code2, Check, Download, Clock, Target, Percent, UserPlus, Repeat, Award, MapPin, Flame, Truck, ImagePlus, X, PlusCircle, FileText, History, Plus as PlusIcon, Minus, Wallet, Hourglass, Undo2, ChevronDown, PackageCheck, ChevronUp, ChevronDown as ChevronDownIcon, Camera, Cake, Frame, Layers, CalendarClock, UserRound, MoreVertical } from 'lucide-react';
-import ZonesManager from '@/components/ZonesManager';
+import { LayoutDashboard, ShoppingBag, Store, IceCream2, Users, Settings, Plus, Pencil, Trash2, CalendarDays, DollarSign, Package, TrendingUp, RefreshCw, Loader2, UserCheck, Phone, MessageCircle, Code2, Check, Download, Clock, Target, Percent, UserPlus, Repeat, Award, MapPin, Flame, Truck, ImagePlus, X, PlusCircle, FileText, History, Plus as PlusIcon, Minus, Wallet, Hourglass, Undo2, ChevronDown, PackageCheck, ChevronUp, ChevronDown as ChevronDownIcon, Camera, Cake, Frame, Layers, CalendarClock, UserRound, MoreVertical, Upload } from 'lucide-react';
 import SalesHeatmap from '@/components/SalesHeatmap';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import OrderForm from '@/components/OrderForm';
@@ -82,15 +82,27 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
 
   const [activeSection, setActiveSection] = useState(role === 'vendor' ? 'clientes' : 'resumen');
   const [configSubSection, setConfigSubSection] = useState('general');
-  const [stats, setStats] = useState(null);
-  const [orders, setOrders] = useState([]);
-  const [flavors, setFlavors] = useState([]);
-  const [users, setUsers] = useState([]);
+  const [stats, setStats] = useState(() => getLocalCache('admin_stats') || null);
+  const [orders, setOrders] = useState(() => getLocalCache('admin_orders') || []);
+  const [flavors, setFlavors] = useState(() => getLocalCache('flavors') || []);
+  const [users, setUsers] = useState(() => getLocalCache('users') || []);
   const [deliveryLocations, setDeliveryLocations] = useState([]);
-  const [settings, setSettings] = useState({ exchange_rate_ves: 36.5 });
+  const [settings, setSettings] = useState(() => getLocalCache('settings') || { exchange_rate_ves: 36.5 });
   const [dateFrom, setDateFrom] = useState(null);
   const [dateTo, setDateTo] = useState(null);
   const [statusFilter, setStatusFilter] = useState(['all']);
+
+  // Optimistic override lock to prevent polling / SSE race condition flickering
+  const pendingOptimisticOrdersRef = useRef(new Map());
+
+  const applyOptimisticOrderUpdate = useCallback((orderId, patch) => {
+    pendingOptimisticOrdersRef.current.set(orderId, { patch, timestamp: Date.now() });
+    setOrders(prev => (Array.isArray(prev) ? prev : []).map(o => o.id === orderId ? { ...o, ...patch } : o));
+  }, []);
+
+  const clearOptimisticOrderUpdate = useCallback((orderId) => {
+    pendingOptimisticOrdersRef.current.delete(orderId);
+  }, []);
 
   const toggleStatusFilter = (id) => {
     if (id === 'all') {
@@ -122,7 +134,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const [flavorForm, setFlavorForm] = useState({ name: '', price_usd: '', available: true, stock: '', stock_unlimited: false, image: '' });
   const [showUserDialog, setShowUserDialog] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
-  const [userForm, setUserForm] = useState({ name: '', username: '', password: '', role: 'vendedor' });
+  const [userForm, setUserForm] = useState({ name: '', username: '', password: '', role: 'vendedor', color: '#501122' });
   const [exchangeRate, setExchangeRate] = useState('');
   const { notifications } = useNotifications();
 
@@ -156,12 +168,18 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const [reportDateTo, setReportDateTo] = useState(null);
   const [loadingReport, setLoadingReport] = useState(false);
 
-  // Map tab state
-  const [mapTab, setMapTab] = useState('zones');
+  // CSV Import state
+  const [showImportCustomersDialog, setShowImportCustomersDialog] = useState(false);
+  const [importedNewCustomers, setImportedNewCustomers] = useState([]);
+  const [savingImportGenders, setSavingImportGenders] = useState(false);
+  const fileInputRef = useRef(null);
+  const [isImporting, setIsImporting] = useState(false);
+  useBackButtonClose(showImportCustomersDialog, () => setShowImportCustomersDialog(false));
 
   // Quotes (cotizaciones ficticias)
   const [quotes, setQuotes] = useState([]);
   const [resumingQuote, setResumingQuote] = useState(null);
+  const [selectedCustomerForOrder, setSelectedCustomerForOrder] = useState(null);
 
   // Stock movements
   const [showStockDialog, setShowStockDialog] = useState(false);
@@ -182,44 +200,44 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const [expandedFinanceDelivery, setExpandedFinanceDelivery] = useState(null);
 
   const loadFast = useCallback(async () => {
-    // Instant cache read
-    const cStats = getLocalCache('admin_stats');
-    if (cStats) setStats(cStats);
-    const cOrders = getLocalCache('admin_orders');
-    const isAllStatus = !statusFilter || statusFilter.includes('all') || statusFilter.length === 0;
-    if (cOrders && isAllStatus && !dateFrom && !dateTo) setOrders(cOrders);
-
     try {
-      const orderParams = {};
-      if (statusFilter && !isAllStatus) {
-        orderParams.status = statusFilter.join(',');
-      }
-      if (dateFrom) orderParams.date_from = dateFrom.toISOString().split('T')[0];
-      if (dateTo) orderParams.date_to = dateTo.toISOString().split('T')[0];
       const [st, ord, locs] = await Promise.all([
         api.get('/dashboard/stats'),
-        api.get('/orders', { params: orderParams }),
+        api.get('/orders'),
         api.get('/delivery/locations').catch(() => ({ data: [] })),
       ]);
       setStats(st.data);
       setLocalCache('admin_stats', st.data);
-      setOrders(ord.data);
-      if (isAllStatus && !dateFrom && !dateTo) setLocalCache('admin_orders', ord.data);
+
+      const now = Date.now();
+      const rawOrders = ord.data || [];
+      const mergedOrders = rawOrders
+        .filter(o => {
+          const pending = pendingOptimisticOrdersRef.current.get(o.id);
+          if (pending && pending.deleted && now - pending.timestamp < 5000) return false;
+          return true;
+        })
+        .map(o => {
+          const pending = pendingOptimisticOrdersRef.current.get(o.id);
+          if (pending && !pending.deleted && now - pending.timestamp < 5000) {
+            return { ...o, ...pending.patch };
+          }
+          return o;
+        });
+
+      for (const [id, value] of pendingOptimisticOrdersRef.current.entries()) {
+        if (now - value.timestamp >= 5000) {
+          pendingOptimisticOrdersRef.current.delete(id);
+        }
+      }
+
+      setOrders(mergedOrders);
+      setLocalCache('admin_orders', mergedOrders);
       setDeliveryLocations(locs.data || []);
     } catch { /* silencio en polling */ }
-  }, [statusFilter, dateFrom, dateTo]);
+  }, []);
 
   const loadSlow = useCallback(async () => {
-    const cFlavors = getLocalCache('flavors');
-    if (cFlavors) setFlavors(cFlavors);
-    const cUsers = getLocalCache('users');
-    if (cUsers) setUsers(cUsers);
-    const cSettings = getLocalCache('settings');
-    if (cSettings) {
-      setSettings(cSettings);
-      setExchangeRate(String(cSettings.exchange_rate_ves || 36.5));
-    }
-
     try {
       const usersEndpoint = isAdmin ? '/users' : '/users/deliveries';
       const [fl, us, se] = await Promise.all([
@@ -228,6 +246,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
       setFlavors(fl.data); setLocalCache('flavors', fl.data);
       setUsers(us.data); setLocalCache('users', us.data);
       setSettings(se.data); setLocalCache('settings', se.data);
+      syncCentralPointWithBackend(se.data);
       setExchangeRate(String(se.data.exchange_rate_ves || 36.5));
     } catch { toast.error('Error cargando datos'); }
   }, [isAdmin]);
@@ -244,45 +263,84 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', loadFast);
     // Refresco instantaneo cuando se crea/modifica un pedido o recurso
-    window.addEventListener('lubos:orders-changed', loadFast);
-    window.addEventListener('lubos:notifications-changed', loadFast);
-    window.addEventListener('lubos:flavors-changed', loadSlow);
-    window.addEventListener('lubos:settings-changed', loadSlow);
+    const onLocationUpdate = (e) => {
+      const payload = e.detail;
+      if (!payload || typeof payload.lat !== 'number' || typeof payload.lng !== 'number') return;
+      setDeliveryLocations(prev => {
+        const driverId = payload.driver_id;
+        const existing = (prev || []).find(d => d.delivery_id === driverId);
+        if (existing && existing.updated_at && payload.updated_at) {
+          const existingTime = new Date(existing.updated_at).getTime();
+          const incomingTime = new Date(payload.updated_at).getTime();
+          if (existingTime >= incomingTime) {
+            // Discard older queued locations to stay perfectly updated on the latest position
+            return prev;
+          }
+        }
+        const filtered = (prev || []).filter(d => d.delivery_id !== driverId);
+        return [...filtered, {
+          delivery_id: driverId,
+          name: payload.name || 'Repartidor',
+          lat: payload.lat,
+          lng: payload.lng,
+          color: payload.color !== undefined ? payload.color : (existing ? existing.color : null),
+          photo_url: payload.photo_url !== undefined ? payload.photo_url : (existing ? existing.photo_url : null),
+          updated_at: payload.updated_at || new Date().toISOString(),
+        }];
+      });
+    };
+    window.addEventListener('lubos:location_update', onLocationUpdate);
+    const onOrdersSync = () => { loadFast(); loadQuotes(); };
+    const onNotifsSync = () => loadFast();
+    const onFlavorsSync = () => loadSlow();
+    const onSettingsSync = () => loadSlow();
+
+    window.addEventListener('lubos:orders-changed', onOrdersSync);
+    window.addEventListener('lubos:notifications-changed', onNotifsSync);
+    window.addEventListener('lubos:flavors-changed', onFlavorsSync);
+    window.addEventListener('lubos:settings-changed', onSettingsSync);
     return () => {
       clearInterval(interval);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', loadFast);
-      window.removeEventListener('lubos:orders-changed', loadFast);
-      window.removeEventListener('lubos:notifications-changed', loadFast);
-      window.removeEventListener('lubos:flavors-changed', loadSlow);
-      window.removeEventListener('lubos:settings-changed', loadSlow);
+      window.removeEventListener('lubos:location_update', onLocationUpdate);
+      window.removeEventListener('lubos:orders-changed', onOrdersSync);
+      window.removeEventListener('lubos:notifications-changed', onNotifsSync);
+      window.removeEventListener('lubos:flavors-changed', onFlavorsSync);
+      window.removeEventListener('lubos:settings-changed', onSettingsSync);
     };
   }, [loadFast, loadSlow]);
 
-  const loadClientStats = useCallback(async () => {
+  const loadClientStats = useCallback(async (searchQuery = clientSearch) => {
     const cached = getLocalCache('admin_client_stats');
-    if (cached) setClientStats(cached);
+    if (cached && !searchQuery.trim()) setClientStats(cached);
 
     setLoadingClientStats(true);
     try {
-      const params = clientPeriod !== 'all' ? { period: clientPeriod } : {};
+      const params = { limit: 50 };
+      if (clientPeriod !== 'all') params.period = clientPeriod;
+      if (searchQuery.trim()) params.q = searchQuery.trim();
+
       const { data } = await api.get('/dashboard/client-stats', { params });
       setClientStats(data);
-      setLocalCache('admin_client_stats', data);
+      if (!searchQuery.trim()) setLocalCache('admin_client_stats', data);
     } catch { toast.error('Error cargando estadisticas'); }
     setLoadingClientStats(false);
-  }, [clientPeriod]);
+  }, [clientPeriod, clientSearch]);
 
   useEffect(() => {
     if (activeSection === 'clientes') {
-      loadClientStats();
+      const timer = setTimeout(() => {
+        loadClientStats(clientSearch);
+      }, clientSearch ? 300 : 0);
+      return () => clearTimeout(timer);
     }
-  }, [activeSection, loadClientStats]);
+  }, [activeSection, clientPeriod, clientSearch, loadClientStats]);
 
   useEffect(() => {
     const handleSync = () => {
       if (activeSection === 'clientes') {
-        loadClientStats();
+        loadClientStats(clientSearch);
       }
     };
     window.addEventListener('lubos:customers-changed', handleSync);
@@ -291,7 +349,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
       window.removeEventListener('lubos:customers-changed', handleSync);
       window.removeEventListener('lubos:orders-changed', handleSync);
     };
-  }, [activeSection, loadClientStats]);
+  }, [activeSection, clientSearch, loadClientStats]);
 
   const loadReport = useCallback(async () => {
     setLoadingReport(true);
@@ -329,6 +387,70 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
       window.URL.revokeObjectURL(url);
       toast.success('Reporte exportado');
     } catch { toast.error('Error exportando'); }
+  };
+
+  const triggerImportClick = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.click();
+    }
+  };
+
+  const handleCsvImport = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsImporting(true);
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const text = event.target.result;
+        const { data } = await api.post('/dashboard/import-csv', { csvText: text });
+        if (data.success) {
+          toast.success(`Se importaron ${data.importedCount} pedidos correctamente.`);
+          
+          // Trigger data reload
+          loadFast();
+          loadSlow();
+          loadReport();
+
+          if (data.newCustomers && data.newCustomers.length > 0) {
+            setImportedNewCustomers(data.newCustomers.map(c => ({ ...c, gender: null })));
+            setShowImportCustomersDialog(true);
+          }
+        } else {
+          toast.error('Error al importar el archivo CSV.');
+        }
+      } catch (err) {
+        toast.error(err?.response?.data?.detail || 'Error al importar pedidos');
+      } finally {
+        setIsImporting(false);
+        if (fileInputRef.current) {
+          fileInputRef.current.value = '';
+        }
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const saveImportGenders = async () => {
+    setSavingImportGenders(true);
+    try {
+      await api.put('/customers/bulk-gender', { customers: importedNewCustomers });
+      toast.success('Géneros de clientes actualizados correctamente.');
+      setShowImportCustomersDialog(false);
+      loadFast();
+      loadSlow();
+    } catch (err) {
+      toast.error('Error al guardar géneros de clientes.');
+    } finally {
+      setSavingImportGenders(false);
+    }
+  };
+
+  const handleImportGenderSelect = (customerId, gender) => {
+    setImportedNewCustomers(prev =>
+      prev.map(c => (c.id === customerId ? { ...c, gender } : c))
+    );
   };
 
   const loadWidgetSettings = useCallback(async () => {
@@ -403,14 +525,55 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const openEditFlavor = (f) => { setEditingFlavor(f); setFlavorForm({ name: f.name, price_usd: String(f.price_usd), available: f.available, stock: String(f.stock || 0), stock_unlimited: !!f.stock_unlimited, image: f.image || '' }); setShowFlavorDialog(true); };
   const saveFlavor = async () => {
     if (!flavorForm.name || !flavorForm.price_usd) { toast.error('Completa los campos'); return; }
+    const payload = {
+      name: flavorForm.name,
+      price_usd: parseFloat(flavorForm.price_usd),
+      available: flavorForm.available,
+      stock: parseInt(flavorForm.stock || 0),
+      stock_unlimited: !!flavorForm.stock_unlimited,
+      image: flavorForm.image || null,
+    };
+    const prevFlavors = [...flavors];
+    const tempId = editingFlavor ? editingFlavor.id : `temp_${Date.now()}`;
+    const newFlavor = { id: tempId, ...payload };
+
+    // 0ms Optimistic UI update
+    if (editingFlavor) {
+      setFlavors(p => p.map(f => f.id === editingFlavor.id ? newFlavor : f));
+      toast.success('Sabor actualizado');
+    } else {
+      setFlavors(p => [...p, newFlavor]);
+      toast.success('Sabor creado');
+    }
+    setShowFlavorDialog(false);
+    notifyLocalChange('flavors_changed', { self: true });
+
     try {
-      const payload = { name: flavorForm.name, price_usd: parseFloat(flavorForm.price_usd), available: flavorForm.available, stock: parseInt(flavorForm.stock || 0), stock_unlimited: !!flavorForm.stock_unlimited, image: flavorForm.image || null };
-      if (editingFlavor) { await api.put(`/flavors/${editingFlavor.id}`, payload); toast.success('Sabor actualizado'); }
-      else { await api.post('/flavors', payload); toast.success('Sabor creado'); }
-      setShowFlavorDialog(false); loadAll();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+      if (editingFlavor) {
+        await api.put(`/flavors/${editingFlavor.id}`, payload);
+      } else {
+        const res = await api.post('/flavors', payload);
+        if (res.data?.id) {
+          setFlavors(p => p.map(f => f.id === tempId ? res.data : f));
+        }
+      }
+    } catch (err) {
+      setFlavors(prevFlavors);
+      toast.error(err.response?.data?.detail || 'Error al guardar sabor');
+    }
   };
-  const deleteFlavor = async (id) => { try { await api.delete(`/flavors/${id}`); toast.success('Eliminado'); loadAll(); } catch { toast.error('Error'); } };
+  const deleteFlavor = async (id) => {
+    const prevFlavors = [...flavors];
+    setFlavors(p => p.filter(f => f.id !== id));
+    toast.success('Eliminado');
+    notifyLocalChange('flavors_changed', { self: true });
+    try {
+      await api.delete(`/flavors/${id}`);
+    } catch {
+      setFlavors(prevFlavors);
+      toast.error('Error al eliminar sabor');
+    }
+  };
 
   const moveFlavor = async (index, direction) => {
     const newList = [...flavors];
@@ -431,17 +594,17 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
     const prevStatus = prev?.status;
 
     // 0ms Optimistic UI update
-    setOrders(p => p.map(o => o.id === orderId ? { ...o, status } : o));
+    applyOptimisticOrderUpdate(orderId, { status });
     if (prevStatus === 'sin_pagar' && status === 'pendiente') {
       playNotificationSound('new_sale'); // caja registradora instantanea
     }
-    notifyLocalChange('orders_changed');
+    notifyLocalChange('orders_changed', { self: true });
     toast.success('Estado actualizado');
 
     try {
       await api.patch(`/orders/${orderId}/status`, { status });
     } catch (err) {
-      // Revert on error
+      clearOptimisticOrderUpdate(orderId);
       setOrders(p => p.map(o => o.id === orderId ? { ...o, status: prevStatus } : o));
       toast.error(err.response?.data?.detail || 'Error actualizando estado');
     }
@@ -472,20 +635,56 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   };
 
   // User CRUD
-  const openAddUser = () => { setEditingUser(null); setUserForm({ name: '', username: '', password: '', role: 'vendedor' }); setShowUserDialog(true); };
-  const openEditUser = (u) => { setEditingUser(u); setUserForm({ name: u.name, username: u.username, password: '', role: u.role }); setShowUserDialog(true); };
+  const openAddUser = () => { setEditingUser(null); setUserForm({ name: '', username: '', password: '', role: 'vendedor', color: '#501122' }); setShowUserDialog(true); };
+  const openEditUser = (u) => { setEditingUser(u); setUserForm({ name: u.name, username: u.username, password: '', role: u.role, color: u.color || '#501122' }); setShowUserDialog(true); };
   const saveUser = async () => {
     if (!userForm.name || !userForm.username) { toast.error('Campos requeridos'); return; }
     if (!editingUser && !userForm.password) { toast.error('Contrasena requerida'); return; }
+
+    const payload = { name: userForm.name, username: userForm.username, role: userForm.role, color: userForm.color || '#501122' };
+    if (userForm.password) payload.password = userForm.password;
+
+    const prevUsers = [...users];
+    const tempId = editingUser ? editingUser.id : `temp_${Date.now()}`;
+    const newUser = { id: tempId, name: userForm.name, username: userForm.username, role: userForm.role, color: userForm.color || '#501122' };
+
+    // 0ms Optimistic UI update
+    if (editingUser) {
+      setUsers(p => p.map(u => u.id === editingUser.id ? { ...u, ...newUser } : u));
+      toast.success('Actualizado');
+    } else {
+      setUsers(p => [...p, newUser]);
+      toast.success('Creado');
+    }
+    setShowUserDialog(false);
+    notifyLocalChange('users_changed', { self: true });
+
     try {
-      const payload = { name: userForm.name, username: userForm.username, role: userForm.role };
-      if (userForm.password) payload.password = userForm.password;
-      if (editingUser) { await api.put(`/users/${editingUser.id}`, payload); toast.success('Actualizado'); }
-      else { await api.post('/users', { ...payload, password: userForm.password }); toast.success('Creado'); }
-      setShowUserDialog(false); loadAll();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+      if (editingUser) {
+        await api.put(`/users/${editingUser.id}`, payload);
+      } else {
+        const res = await api.post('/users', { ...payload, password: userForm.password });
+        if (res.data?.id) {
+          setUsers(p => p.map(u => u.id === tempId ? res.data : u));
+        }
+      }
+    } catch (err) {
+      setUsers(prevUsers);
+      toast.error(err.response?.data?.detail || 'Error al guardar usuario');
+    }
   };
-  const deleteUser = async (id) => { try { await api.delete(`/users/${id}`); toast.success('Eliminado'); loadAll(); } catch { toast.error('Error'); } };
+  const deleteUser = async (id) => {
+    const prevUsers = [...users];
+    setUsers(p => p.filter(u => u.id !== id));
+    toast.success('Eliminado');
+    notifyLocalChange('users_changed', { self: true });
+    try {
+      await api.delete(`/users/${id}`);
+    } catch {
+      setUsers(prevUsers);
+      toast.error('Error al eliminar usuario');
+    }
+  };
 
   const updateUserPhoto = async (userId, file) => {
     if (!file) return;
@@ -515,15 +714,26 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   };
   const deleteClient = async (clientId) => {
     if (!window.confirm('Eliminar este cliente y todos sus pedidos?')) return;
+    const prevStats = clientStats;
+    if (clientStats && clientStats.customers) {
+      setClientStats(p => p ? {
+        ...p,
+        customers: (p.customers || []).filter(c => c.id !== clientId),
+        total_customers: Math.max(0, (p.total_customers || 1) - 1)
+      } : p);
+    }
+    toast.success('Cliente eliminado');
+    setShowClientDialog(false);
+
     try {
       await api.delete(`/customers/${clientId}`);
-      toast.success('Cliente eliminado');
-      setShowClientDialog(false);
       notifyLocalChange('customers_changed');
       notifyLocalChange('orders_changed');
       loadClientStats();
-      loadAll();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+    } catch (err) {
+      setClientStats(prevStats);
+      toast.error(err.response?.data?.detail || 'Error al eliminar cliente');
+    }
   };
 
   // Customer create/edit
@@ -548,29 +758,65 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const saveCustomer = async () => {
     if (!customerForm.name || !customerForm.phone) { toast.error('Completa nombre y telefono'); return; }
     const fullPhone = `${customerForm.prefix}${customerForm.phone}`;
+    const prevStats = clientStats;
+    const tempId = editingCustomer ? editingCustomer.id : `temp_${Date.now()}`;
+    const newCust = {
+      id: tempId,
+      name: customerForm.name,
+      phone: fullPhone,
+      gender: customerForm.gender,
+      total_orders: editingCustomer?.total_orders || 0,
+      total_spent: editingCustomer?.total_spent || 0
+    };
+
+    // 0ms Optimistic UI update
+    if (clientStats && clientStats.customers) {
+      if (editingCustomer) {
+        setClientStats(p => p ? {
+          ...p,
+          customers: (p.customers || []).map(c => c.id === editingCustomer.id ? { ...c, ...newCust } : c)
+        } : p);
+        toast.success('Cliente actualizado');
+      } else {
+        setClientStats(p => p ? {
+          ...p,
+          customers: [newCust, ...(p.customers || []).filter(c => c.id !== tempId)],
+          total_customers: (p.total_customers || 0) + 1
+        } : p);
+        toast.success('Cliente creado');
+      }
+    }
+    setShowCustomerForm(false);
+
     try {
       if (editingCustomer) {
         await api.put(`/customers/${editingCustomer.id}`, { name: customerForm.name, phone: fullPhone, gender: customerForm.gender });
-        toast.success('Cliente actualizado');
       } else {
-        await api.post('/customers', { name: customerForm.name, phone: fullPhone, gender: customerForm.gender });
-        toast.success('Cliente creado');
+        const { data } = await api.post('/customers', { name: customerForm.name, phone: fullPhone, gender: customerForm.gender });
+        if (data && data.id) {
+          setClientStats(p => p ? {
+            ...p,
+            customers: (p.customers || []).map(c => c.id === tempId ? { ...c, ...data } : c)
+          } : p);
+        }
       }
-      setShowCustomerForm(false);
-      notifyLocalChange('customers_changed');
+      notifyLocalChange('customers_changed', { self: true });
       loadClientStats();
-      loadAll();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+    } catch (err) {
+      setClientStats(prevStats);
+      toast.error(err.response?.data?.detail || 'Error al guardar cliente');
+    }
   };
 
   const cancelOrder = async (orderId) => {
     const prevOrder = orders.find(o => o.id === orderId);
-    setOrders(p => p.map(o => o.id === orderId ? { ...o, status: 'cancelado' } : o));
-    notifyLocalChange('orders_changed');
+    applyOptimisticOrderUpdate(orderId, { status: 'cancelado' });
+    notifyLocalChange('orders_changed', { self: true });
     toast.success('Pedido cancelado');
     try {
       await api.patch(`/orders/${orderId}/status`, { status: 'cancelado' });
     } catch (err) {
+      clearOptimisticOrderUpdate(orderId);
       if (prevOrder) setOrders(p => p.map(o => o.id === orderId ? prevOrder : o));
       toast.error(err.response?.data?.detail || 'Error al cancelar');
     }
@@ -578,14 +824,17 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
 
   const togglePrepared = async (orderId, prepared) => {
     // Optimistic update for instant UI feedback
-    setOrders(prev => prev.map(o => o.id === orderId ? { ...o, prepared, prepared_by_name: prepared ? o.prepared_by_name : null } : o));
-    notifyLocalChange('orders_changed');
+    const target = orders.find(o => o.id === orderId);
+    applyOptimisticOrderUpdate(orderId, { prepared, prepared_by_name: prepared ? (target?.prepared_by_name || 'Admin') : null });
+    notifyLocalChange('orders_changed', { self: true });
     try {
       const res = await api.patch(`/orders/${orderId}/prepared`, { prepared });
       // Sync server fields (prepared_by_name, prepared_at)
-      setOrders(prev => prev.map(o => o.id === orderId ? { ...o, ...res.data } : o));
+      if (res.data) {
+        applyOptimisticOrderUpdate(orderId, { ...res.data });
+      }
     } catch (err) {
-      // Revert on failure
+      clearOptimisticOrderUpdate(orderId);
       setOrders(prev => prev.map(o => o.id === orderId ? { ...o, prepared: !prepared } : o));
       toast.error(err.response?.data?.detail || 'Error');
     }
@@ -593,13 +842,16 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
 
   const toggleWaitNotice = async (orderId, currentVal) => {
     const nextVal = !currentVal;
-    setOrders(prev => prev.map(o => o.id === orderId ? { ...o, wait_for_notice: nextVal } : o));
-    notifyLocalChange('orders_changed');
+    applyOptimisticOrderUpdate(orderId, { wait_for_notice: nextVal });
+    notifyLocalChange('orders_changed', { self: true });
     try {
       const res = await api.patch(`/orders/${orderId}/toggle-wait-notice`, { wait_for_notice: nextVal });
-      setOrders(prev => prev.map(o => o.id === orderId ? { ...o, ...res.data } : o));
+      if (res.data) {
+        applyOptimisticOrderUpdate(orderId, { ...res.data });
+      }
       toast.success(nextVal ? 'Pedido marcado como esperar aviso' : 'Esperar aviso desactivado');
     } catch (err) {
+      clearOptimisticOrderUpdate(orderId);
       setOrders(prev => prev.map(o => o.id === orderId ? { ...o, wait_for_notice: currentVal } : o));
       toast.error(err.response?.data?.detail || 'Error cambiando estado');
     }
@@ -612,14 +864,16 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
     const targetId = deletingOrderId;
     const targetOrder = orders.find(o => o.id === targetId);
 
+    pendingOptimisticOrdersRef.current.set(targetId, { deleted: true, timestamp: Date.now() });
     setOrders(p => p.filter(o => o.id !== targetId));
-    notifyLocalChange('orders_changed');
+    notifyLocalChange('orders_changed', { self: true });
     setDeletingOrderId(null);
     toast.success('Pedido eliminado');
 
     try {
       await api.delete(`/orders/${targetId}`);
     } catch (err) {
+      clearOptimisticOrderUpdate(targetId);
       if (targetOrder) setOrders(p => [...p, targetOrder]);
       toast.error(err.response?.data?.detail || 'Error al eliminar');
     }
@@ -630,15 +884,17 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
 
   // Unassign delivery (return to "Disponibles" pool)
   const unassignDelivery = async (orderId) => {
-    if (!window.confirm('Liberar este pedido para que otro delivery lo tome?')) return;
     const targetOrder = orders.find(o => o.id === orderId);
-    setOrders(p => p.map(o => o.id === orderId ? { ...o, delivery_id: null, delivery_name: null } : o));
-    notifyLocalChange('orders_changed');
+    const newStatus = targetOrder?.status === 'en_camino' ? 'pendiente' : targetOrder?.status;
+    const patch = { delivery_id: null, delivery_name: null, delivery_photo_url: null, status: newStatus };
+    applyOptimisticOrderUpdate(orderId, patch);
+    notifyLocalChange('orders_changed', { self: true });
     toast.success('Pedido devuelto a Disponibles');
 
     try {
       await api.post(`/orders/${orderId}/unassign-delivery`);
     } catch (err) {
+      clearOptimisticOrderUpdate(orderId);
       if (targetOrder) setOrders(p => p.map(o => o.id === orderId ? targetOrder : o));
       toast.error(err.response?.data?.detail || 'Error');
     }
@@ -648,13 +904,16 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
   const assignDelivery = async (orderId, deliveryId) => {
     const targetOrder = orders.find(o => o.id === orderId);
     const delUser = users.find(u => u.id === deliveryId);
-    setOrders(p => p.map(o => o.id === orderId ? { ...o, delivery_id: deliveryId, delivery_name: delUser?.name || 'Delivery' } : o));
-    notifyLocalChange('orders_changed');
+    const newStatus = targetOrder?.status === 'en_camino' ? 'pendiente' : targetOrder?.status;
+    const patch = { delivery_id: deliveryId, delivery_name: delUser?.name || 'Delivery', delivery_photo_url: delUser?.photo_data_url || null, status: newStatus };
+    applyOptimisticOrderUpdate(orderId, patch);
+    notifyLocalChange('orders_changed', { self: true });
     toast.success('Delivery asignado');
 
     try {
       await api.post(`/orders/${orderId}/assign-delivery`, { delivery_id: deliveryId });
     } catch (err) {
+      clearOptimisticOrderUpdate(orderId);
       if (targetOrder) setOrders(p => p.map(o => o.id === orderId ? targetOrder : o));
       toast.error(err.response?.data?.detail || 'Error al asignar');
     }
@@ -685,12 +944,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
     { id: 'widgets', icon: Code2, label: 'Widgets' },
   ];
 
-  const filteredClients = clientStats?.customers?.filter(c => {
-    const rawPhone = c.phone || '';
-    const digitsOnly = rawPhone.replace(/[^0-9]/g, '');
-    const combinedText = `${c.name || ''} ${rawPhone} ${digitsOnly}`;
-    return fuzzyMatch(combinedText, clientSearch);
-  }) || [];
+  const filteredClients = clientStats?.customers || [];
 
   // Memoized derived collections to avoid re-filtering on every render
   const safeOrdersList = Array.isArray(orders) ? orders : [];
@@ -723,6 +977,17 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                 <Button onClick={exportReport} variant="outline" className="border-[#501122]/15 text-[#501122] hover:bg-[#501122]/5 rounded-full h-9 px-4 text-xs font-semibold" data-testid="export-btn">
                   <Download className="h-3.5 w-3.5 mr-1.5" />Exportar CSV
                 </Button>
+                <Button onClick={triggerImportClick} disabled={isImporting} variant="outline" className="border-[#3F634A]/15 text-[#3F634A] hover:bg-[#3F634A]/5 rounded-full h-9 px-4 text-xs font-semibold" data-testid="import-btn">
+                  {isImporting ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <Upload className="h-3.5 w-3.5 mr-1.5" />}
+                  Importar CSV
+                </Button>
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={handleCsvImport}
+                  accept=".csv"
+                  className="hidden"
+                />
                 <Button onClick={loadReport} variant="outline" className="border-[#501122]/15 text-[#501122] hover:bg-[#501122]/5 rounded-full h-9 px-3 text-xs" data-testid="report-refresh-btn">
                   {loadingReport ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                 </Button>
@@ -761,322 +1026,443 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
 
           {report && (
             <>
-              {/* Executive Summary Insight Bar */}
-              <div className="bg-gradient-to-r from-[#501122] via-[#63182C] to-[#3F634A] rounded-[1.8rem] p-5 text-white shadow-lg flex flex-wrap items-center justify-between gap-4">
-                <div className="space-y-1">
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-amber-200/90">Resumen Ejecutivo del Período</p>
-                  <p className="text-xl font-heading font-semibold">
-                    Facturación Total de <span className="text-amber-300">{formatUSD(report.summary.total_revenue)}</span> ({formatVES(report.summary.total_revenue, rate)})
-                  </p>
-                  <p className="text-xs text-white/80">
-                    {report.summary.total_delivered} pedidos entregados exitosamente &middot; Tasa de conversión/cumplimiento: <span className="font-bold text-emerald-300">{(100 - (report.summary.cancellation_rate || 0)).toFixed(1)}%</span>
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="bg-white/10 backdrop-blur-md px-3.5 py-2 rounded-2xl text-center border border-white/10">
-                    <p className="text-[9px] uppercase tracking-wider text-white/70 font-semibold">Ticket Promedio</p>
-                    <p className="font-heading text-lg font-bold text-amber-200">{formatUSD(report.summary.avg_ticket)}</p>
-                  </div>
-                  <div className="bg-white/10 backdrop-blur-md px-3.5 py-2 rounded-2xl text-center border border-white/10">
-                    <p className="text-[9px] uppercase tracking-wider text-white/70 font-semibold">Hora Clave</p>
-                    <p className="font-heading text-lg font-bold text-emerald-200">{report.peak_hour.split(' ')[0] || '19:00'}</p>
-                  </div>
-                  <div className="bg-white/10 backdrop-blur-md px-3.5 py-2 rounded-2xl text-center border border-white/10">
-                    <p className="text-[9px] uppercase tracking-wider text-white/70 font-semibold">Clientes Recurrentes</p>
-                    <p className="font-heading text-lg font-bold text-white">{report.summary.retention_rate || 60}%</p>
-                  </div>
-                </div>
-              </div>
-
               {/* Primary KPI Grid */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 {/* 1. Total Revenue Card with Breakdown */}
-                <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3" data-testid="kpi-revenue-card">
-                  <div className="flex items-center gap-3">
-                    <div className="w-11 h-11 rounded-2xl bg-[#3F634A] flex items-center justify-center shrink-0">
-                      <DollarSign className="h-5 w-5 text-white" />
-                    </div>
-                    <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Ingresos Totales</p>
-                      <p className="font-heading text-2xl text-[#501122] font-bold" data-testid="kpi-total-revenue">{formatUSD(report.summary.total_revenue)}</p>
-                      <p className="text-[10px] text-[#78686C] font-medium">{formatVES(report.summary.total_revenue, rate)}</p>
-                    </div>
-                  </div>
-                  {(() => {
-                    const driverPct = settings.delivery_driver_pct ?? 85;
-                    const companyPct = 100 - driverPct;
-                    const delRev = report.summary.delivery_revenue || 0;
-                    return (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 border-t border-[#501122]/5">
-                        <div className="bg-[#C27A29]/10 rounded-xl p-2.5 text-center">
-                          <p className="text-[9px] uppercase font-bold text-[#C27A29]">Venta Productos</p>
-                          <p className="font-heading text-sm text-[#501122] font-bold">{formatUSD(report.summary.product_revenue || 0)}</p>
-                        </div>
-                        <div className="bg-[#3F634A]/10 rounded-xl p-2.5 text-center space-y-1">
-                          <p className="text-[9px] uppercase font-bold text-[#3F634A]">Cobro Delivery Total</p>
-                          <p className="font-heading text-sm text-[#501122] font-bold">{formatUSD(delRev)}</p>
-                          <div className="flex justify-around items-center text-[10px] pt-1 border-t border-[#3F634A]/15 font-semibold">
-                            <span className="text-[#3F634A]">Repartidores ({driverPct}%): <b>{formatUSD(delRev * (driverPct / 100))}</b></span>
-                            <span className="text-[#501122]">Empresa ({companyPct}%): <b>{formatUSD(delRev * (companyPct / 100))}</b></span>
-                          </div>
+                <div className={`bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`} data-testid="kpi-revenue-card">
+                  {loadingReport ? (
+                    <div className="space-y-4 py-1">
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-[#501122]/5 shrink-0"></div>
+                        <div className="space-y-2 flex-1">
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
+                          <div className="h-6 bg-[#501122]/10 rounded w-3/4"></div>
                         </div>
                       </div>
-                    );
-                  })()}
+                      <div className="grid grid-cols-2 gap-2 pt-2 border-t border-[#501122]/5">
+                        <div className="h-12 bg-[#501122]/5 rounded-xl"></div>
+                        <div className="h-12 bg-[#501122]/5 rounded-xl"></div>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-[#3F634A] flex items-center justify-center shrink-0">
+                          <DollarSign className="h-5 w-5 text-white" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Ingresos Totales</p>
+                          <p className="font-heading text-2xl text-[#501122] font-bold" data-testid="kpi-total-revenue">{formatUSD(report.summary.total_revenue)}</p>
+                          <p className="text-[10px] text-[#78686C] font-medium">{formatVES(report.summary.total_revenue, rate)}</p>
+                        </div>
+                      </div>
+                      {(() => {
+                        const driverPct = settings.delivery_driver_pct ?? 85;
+                        const companyPct = 100 - driverPct;
+                        const delRev = report.summary.delivery_revenue || 0;
+                        return (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 border-t border-[#501122]/5">
+                            <div className="bg-[#C27A29]/10 rounded-xl p-2.5 text-center">
+                              <p className="text-[9px] uppercase font-bold text-[#C27A29]">Venta Productos</p>
+                              <p className="font-heading text-sm text-[#501122] font-bold">{formatUSD(report.summary.product_revenue || 0)}</p>
+                            </div>
+                            <div className="bg-[#3F634A]/10 rounded-xl p-2.5 text-center space-y-1">
+                              <p className="text-[9px] uppercase font-bold text-[#3F634A]">Cobro Delivery Total</p>
+                              <p className="font-heading text-sm text-[#501122] font-bold">{formatUSD(delRev)}</p>
+                              <div className="flex justify-around items-center text-[10px] pt-1 border-t border-[#3F634A]/15 font-semibold">
+                                <span className="text-[#3F634A]">Repartidores ({driverPct}%): <b>{formatUSD(delRev * (driverPct / 100))}</b></span>
+                                <span className="text-[#501122]">Empresa ({companyPct}%): <b>{formatUSD(delRev * (companyPct / 100))}</b></span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </>
+                  )}
                 </div>
 
                 {/* 2. Total Orders & Success Rate */}
-                <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3" data-testid="kpi-orders-card">
-                  <div className="flex items-center gap-3">
-                    <div className="w-11 h-11 rounded-2xl bg-[#501122] flex items-center justify-center shrink-0">
-                      <Package className="h-5 w-5 text-white" />
+                <div className={`bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`} data-testid="kpi-orders-card">
+                  {loadingReport ? (
+                    <div className="space-y-4 py-1">
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-[#501122]/5 shrink-0"></div>
+                        <div className="space-y-2 flex-1">
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
+                          <div className="h-6 bg-[#501122]/10 rounded w-3/4"></div>
+                        </div>
+                      </div>
+                      <div className="h-8 bg-[#501122]/5 rounded-xl pt-2 border-t border-[#501122]/5"></div>
                     </div>
-                    <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Volumen de Pedidos</p>
-                      <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.total_orders} <span className="text-xs font-normal text-[#78686C]">pedidos</span></p>
-                      <p className="text-[10px] text-[#3F634A] font-semibold">{report.summary.total_delivered} entregados con éxito</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between text-xs pt-2 border-t border-[#501122]/5">
-                    <span className="text-[#78686C]">Cancelaciones: <b className="text-red-600">{report.summary.total_cancelled} ({report.summary.cancellation_rate}%)</b></span>
-                    <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded-full">
-                      {(100 - (report.summary.cancellation_rate || 0)).toFixed(0)}% Efectivo
-                    </span>
-                  </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-[#501122] flex items-center justify-center shrink-0">
+                          <Package className="h-5 w-5 text-white" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Volumen de Pedidos</p>
+                          <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.total_orders} <span className="text-xs font-normal text-[#78686C]">pedidos</span></p>
+                          <p className="text-[10px] text-[#3F634A] font-semibold">{report.summary.total_delivered} entregados con éxito</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-between text-xs pt-2 border-t border-[#501122]/5">
+                        <span className="text-[#78686C]">Cancelaciones: <b className="text-red-600">{report.summary.total_cancelled} ({report.summary.cancellation_rate}%)</b></span>
+                        <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                          {(100 - (report.summary.cancellation_rate || 0)).toFixed(0)}% Efectivo
+                        </span>
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 {/* 3. Ticket Promedio */}
-                <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3" data-testid="kpi-ticket-card">
-                  <div className="flex items-center gap-3">
-                    <div className="w-11 h-11 rounded-2xl bg-[#C27A29] flex items-center justify-center shrink-0">
-                      <Target className="h-5 w-5 text-white" />
+                <div className={`bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`} data-testid="kpi-ticket-card">
+                  {loadingReport ? (
+                    <div className="space-y-4 py-1">
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-[#501122]/5 shrink-0"></div>
+                        <div className="space-y-2 flex-1">
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
+                          <div className="h-6 bg-[#501122]/10 rounded w-3/4"></div>
+                        </div>
+                      </div>
+                      <div className="h-8 bg-[#501122]/5 rounded-xl pt-2 border-t border-[#501122]/5"></div>
                     </div>
-                    <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Ticket Promedio</p>
-                      <p className="font-heading text-2xl text-[#501122] font-bold">{formatUSD(report.summary.avg_ticket)}</p>
-                      <p className="text-[10px] text-[#78686C]">{formatVES(report.summary.avg_ticket, rate)} por venta</p>
-                    </div>
-                  </div>
-                  <div className="pt-2 border-t border-[#501122]/5 text-center">
-                    <p className="text-[10px] text-[#78686C]">Promedio calculado sobre pedidos completados</p>
-                  </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-[#C27A29] flex items-center justify-center shrink-0">
+                          <Target className="h-5 w-5 text-white" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Ticket Promedio</p>
+                          <p className="font-heading text-2xl text-[#501122] font-bold">{formatUSD(report.summary.avg_ticket)}</p>
+                          <p className="text-[10px] text-[#78686C]">{formatVES(report.summary.avg_ticket, rate)} por venta</p>
+                        </div>
+                      </div>
+                      <div className="pt-2 border-t border-[#501122]/5 text-center">
+                        <p className="text-[10px] text-[#78686C]">Promedio calculado sobre pedidos completados</p>
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 {/* 4. Clientes & Fidelización */}
-                <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3" data-testid="kpi-customers-card">
-                  <div className="flex items-center gap-3">
-                    <div className="w-11 h-11 rounded-2xl bg-[#501122]/80 flex items-center justify-center shrink-0">
-                      <Users className="h-5 w-5 text-white" />
+                <div className={`bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`} data-testid="kpi-customers-card">
+                  {loadingReport ? (
+                    <div className="space-y-4 py-1">
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-[#501122]/5 shrink-0"></div>
+                        <div className="space-y-2 flex-1">
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
+                          <div className="h-6 bg-[#501122]/10 rounded w-3/4"></div>
+                        </div>
+                      </div>
+                      <div className="space-y-2 pt-2 border-t border-[#501122]/5">
+                        <div className="h-3 bg-[#501122]/10 rounded w-full"></div>
+                        <div className="h-3 bg-[#501122]/10 rounded w-5/6"></div>
+                        <div className="h-3 bg-[#501122]/10 rounded w-4/5"></div>
+                      </div>
                     </div>
-                    <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Clientes Únicos</p>
-                      <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.unique_customers}</p>
-                      <p className="text-[10px] text-[#3F634A] font-semibold">{report.summary.new_customers} nuevos ({Math.round(report.summary.new_customers / (report.summary.unique_customers || 1) * 100)}%)</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between text-xs pt-2 border-t border-[#501122]/5">
-                    <span className="text-[#78686C]">Recurrentes: <b className="text-[#501122]">{report.summary.repeat_customers}</b></span>
-                    <span className="bg-amber-100 text-amber-800 text-[10px] font-bold px-2 py-0.5 rounded-full">
-                      {report.summary.retention_rate || 60}% Retención
-                    </span>
-                  </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-3">
+                        <div className="w-11 h-11 rounded-2xl bg-[#501122]/80 flex items-center justify-center shrink-0">
+                          <Users className="h-5 w-5 text-white" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-[#78686C]">Clientes Únicos</p>
+                          <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.unique_customers}</p>
+                        </div>
+                      </div>
+                      <div className="space-y-1.5 pt-2 border-t border-[#501122]/5 text-xs text-[#78686C]">
+                        <div className="flex justify-between items-center">
+                          <span>Con 1 pedido:</span>
+                          <span className="font-bold text-[#501122] bg-[#501122]/5 px-2 py-0.5 rounded-md">{report.summary.pct_1_order || 0}%</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span>Con 2 pedidos:</span>
+                          <span className="font-bold text-[#501122] bg-[#501122]/5 px-2 py-0.5 rounded-md">{report.summary.pct_2_orders || 0}%</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span>Con 3 pedidos:</span>
+                          <span className="font-bold text-[#501122] bg-[#501122]/5 px-2 py-0.5 rounded-md">{report.summary.pct_3_orders || 0}%</span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                          <span>Con 4+ pedidos:</span>
+                          <span className="font-bold text-[#501122] bg-[#501122]/5 px-2 py-0.5 rounded-md">{report.summary.pct_4_plus_orders || 0}%</span>
+                        </div>
+                        <div className="flex justify-between items-center pt-2 border-t border-dashed border-[#501122]/10 text-xs font-semibold">
+                          <span className="text-[#78686C]">Total Recurrentes (&gt;1):</span>
+                          <span className="text-white bg-[#501122] px-2.5 py-0.5 rounded-full text-[11px] font-bold" data-testid="recurrents-count">
+                            {report.summary.repeat_customers || 0} ({report.summary.retention_rate || 0}%)
+                          </span>
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
 
-              {/* Pickup vs Delivery + Quote Conversion Funnel Breakdown */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              {/* Canales de Entrega */}
+              <div className="w-full">
                 {/* Pickup vs Delivery Card */}
-                <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)]" data-testid="pickup-vs-delivery-card">
-                  <div className="flex items-center justify-between mb-3">
-                    <div>
-                      <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
-                        <ShoppingBag className="h-5 w-5 text-[#C27A29]" />Canales de Entrega (Pickup vs Delivery)
-                      </p>
-                      <p className="text-xs text-[#78686C]">Distribución de entregas completadas por tipo</p>
-                    </div>
-                  </div>
-
-                  {(() => {
-                    const totalEntr = (report.summary.pickup_count || 0) + (report.summary.delivery_count || 0);
-                    const pickPct = totalEntr > 0 ? Math.round((report.summary.pickup_count / totalEntr) * 100) : 0;
-                    const delPct = 100 - pickPct;
-                    return (
-                      <div className="space-y-4">
-                        <div className="grid grid-cols-2 gap-4">
-                          <div className="bg-[#C27A29]/10 rounded-2xl p-4 border border-[#C27A29]/20" data-testid="pickup-stat">
-                            <div className="flex items-center justify-between mb-1.5">
-                              <span className="text-xs font-bold uppercase tracking-wider text-[#C27A29] flex items-center gap-1.5">
-                                <ShoppingBag className="h-4 w-4" />Pickup
-                              </span>
-                              <span className="text-xs font-bold text-[#C27A29] bg-[#C27A29]/15 px-2 py-0.5 rounded-full">{pickPct}%</span>
-                            </div>
-                            <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.pickup_count} <span className="text-xs text-[#78686C]">pedidos</span></p>
-                            <p className="text-xs font-semibold text-[#501122] mt-1">Total: {formatUSD(report.summary.pickup_revenue || 0)}</p>
-                          </div>
-
-                          <div className="bg-[#3F634A]/10 rounded-2xl p-4 border border-[#3F634A]/20" data-testid="delivery-stat">
-                            <div className="flex items-center justify-between mb-1.5">
-                              <span className="text-xs font-bold uppercase tracking-wider text-[#3F634A] flex items-center gap-1.5">
-                                <Truck className="h-4 w-4" />Delivery
-                              </span>
-                              <span className="text-xs font-bold text-[#3F634A] bg-[#3F634A]/15 px-2 py-0.5 rounded-full">{delPct}%</span>
-                            </div>
-                            <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.delivery_count} <span className="text-xs text-[#78686C]">pedidos</span></p>
-                            <p className="text-xs font-semibold text-[#501122] mt-1">Total: {formatUSD(report.summary.delivery_orders_revenue || 0)}</p>
-                          </div>
+                <div className={`bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`} data-testid="pickup-vs-delivery-card">
+                  {loadingReport ? (
+                    <div className="space-y-4">
+                      {/* Header skeleton */}
+                      <div className="space-y-2 mb-3">
+                        <div className="h-5 bg-[#501122]/10 rounded w-1/3"></div>
+                        <div className="h-3 bg-[#501122]/10 rounded w-1/4"></div>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div className="h-24 bg-[#501122]/5 rounded-2xl"></div>
+                        <div className="h-24 bg-[#501122]/5 rounded-2xl"></div>
+                        <div className="h-24 bg-[#501122]/5 rounded-2xl"></div>
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex justify-between">
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/4"></div>
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/4"></div>
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/4"></div>
                         </div>
-
-                        {/* Continuous Proportion Bar */}
+                        <div className="h-3 bg-[#501122]/5 rounded-full w-full"></div>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between mb-3">
                         <div>
-                          <div className="flex justify-between text-xs font-semibold mb-1">
-                            <span className="text-[#C27A29]">Retiro en Tienda ({pickPct}%)</span>
-                            <span className="text-[#3F634A]">Envío Delivery ({delPct}%)</span>
-                          </div>
-                          <div className="flex h-3 rounded-full overflow-hidden bg-[#F0E4D8]">
-                            <div className="bg-[#C27A29] transition-all duration-500" style={{ width: `${pickPct}%` }}></div>
-                            <div className="bg-[#3F634A] transition-all duration-500" style={{ width: `${delPct}%` }}></div>
-                          </div>
+                          <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
+                            <ShoppingBag className="h-5 w-5 text-[#C27A29]" />Canales de Entrega (Pickup vs Tienda vs Delivery)
+                          </p>
+                          <p className="text-xs text-[#78686C]">Distribución de entregas completadas por canal</p>
                         </div>
                       </div>
-                    );
-                  })()}
+                      {(() => {
+                        const totalEntr = (report.summary.pickup_count || 0) + (report.summary.delivery_count || 0) + (report.summary.tienda_count || 0);
+                        const pickPct = totalEntr > 0 ? Math.round((report.summary.pickup_count / totalEntr) * 100) : 0;
+                        const tiendaPct = totalEntr > 0 ? Math.round((report.summary.tienda_count / totalEntr) * 100) : 0;
+                        const delPct = totalEntr > 0 ? Math.max(0, 100 - pickPct - tiendaPct) : 0;
+                        return (
+                          <div className="space-y-4">
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                              <div className="bg-[#C27A29]/10 rounded-2xl p-4 border border-[#C27A29]/20" data-testid="pickup-stat">
+                                <div className="flex items-center justify-between mb-1.5">
+                                  <span className="text-xs font-bold uppercase tracking-wider text-[#C27A29] flex items-center gap-1.5">
+                                    <ShoppingBag className="h-4 w-4" />Pickup
+                                  </span>
+                                  <span className="text-xs font-bold text-[#C27A29] bg-[#C27A29]/15 px-2 py-0.5 rounded-full">{pickPct}%</span>
+                                </div>
+                                <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.pickup_count} <span className="text-xs text-[#78686C]">pedidos</span></p>
+                                <p className="text-xs font-semibold text-[#501122] mt-1">Total: {formatUSD(report.summary.pickup_revenue || 0)}</p>
+                              </div>
+
+                              <div className="bg-emerald-500/10 rounded-2xl p-4 border border-emerald-500/20" data-testid="tienda-stat">
+                                <div className="flex items-center justify-between mb-1.5">
+                                  <span className="text-xs font-bold uppercase tracking-wider text-emerald-700 flex items-center gap-1.5">
+                                    <Store className="h-4 w-4" />Tienda
+                                  </span>
+                                  <span className="text-xs font-bold text-emerald-700 bg-emerald-500/15 px-2 py-0.5 rounded-full">{tiendaPct}%</span>
+                                </div>
+                                <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.tienda_count} <span className="text-xs text-[#78686C]">ventas</span></p>
+                                <p className="text-xs font-semibold text-[#501122] mt-1">Total: {formatUSD(report.summary.tienda_revenue || 0)}</p>
+                              </div>
+
+                              <div className="bg-blue-600/10 rounded-2xl p-4 border border-blue-600/20" data-testid="delivery-stat">
+                                <div className="flex items-center justify-between mb-1.5">
+                                  <span className="text-xs font-bold uppercase tracking-wider text-blue-700 flex items-center gap-1.5">
+                                    <Truck className="h-4 w-4" />Delivery
+                                  </span>
+                                  <span className="text-xs font-bold text-blue-700 bg-blue-600/15 px-2 py-0.5 rounded-full">{delPct}%</span>
+                                </div>
+                                <p className="font-heading text-2xl text-[#501122] font-bold">{report.summary.delivery_count} <span className="text-xs text-[#78686C]">pedidos</span></p>
+                                <p className="text-xs font-semibold text-[#501122] mt-1">Total: {formatUSD(report.summary.delivery_orders_revenue || 0)}</p>
+                              </div>
+                            </div>
+
+                            {/* Continuous Proportion Bar */}
+                            <div>
+                              <div className="flex justify-between text-xs font-semibold mb-1">
+                                <span className="text-[#C27A29]">Pickup ({pickPct}%)</span>
+                                <span className="text-emerald-700">Tienda ({tiendaPct}%)</span>
+                                <span className="text-blue-700">Delivery ({delPct}%)</span>
+                              </div>
+                              <div className="flex h-3 rounded-full overflow-hidden bg-[#F0E4D8]">
+                                <div className="bg-[#C27A29] transition-all duration-500" style={{ width: `${pickPct}%` }}></div>
+                                <div className="bg-emerald-500 transition-all duration-500" style={{ width: `${tiendaPct}%` }}></div>
+                                <div className="bg-blue-600 transition-all duration-500" style={{ width: `${delPct}%` }}></div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </>
+                  )}
                 </div>
-
-                {/* Quote Conversion Funnel Card */}
-                {report.quote_funnel && (
-                  <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3" data-testid="quote-funnel-card">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
-                          <FileText className="h-5 w-5 text-[#501122]" />Conversión de Cotizaciones a Pedidos
-                        </p>
-                        <p className="text-xs text-[#78686C]">Efectividad de cotizaciones emitidas convertidas en ventas reales</p>
-                      </div>
-                      <span className="bg-[#3F634A]/10 text-[#3F634A] text-xs font-bold px-2.5 py-1 rounded-full">
-                        {report.quote_funnel.conversion_rate}% Conversión
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center pt-1">
-                      <div className="bg-[#F3EBE0]/60 rounded-xl p-2.5 border border-[#501122]/5">
-                        <p className="text-[10px] uppercase font-bold text-[#78686C]">Emitidas</p>
-                        <p className="font-heading text-lg text-[#501122] font-bold">{report.quote_funnel.total_quotes}</p>
-                      </div>
-                      <div className="bg-[#3F634A]/10 rounded-xl p-2.5 border border-[#3F634A]/20">
-                        <p className="text-[10px] uppercase font-bold text-[#3F634A]">Convertidas</p>
-                        <p className="font-heading text-lg text-[#3F634A] font-bold">{report.quote_funnel.converted_orders}</p>
-                      </div>
-                      <div className="bg-[#C27A29]/10 rounded-xl p-2.5 border border-[#C27A29]/20">
-                        <p className="text-[10px] uppercase font-bold text-[#C27A29]">Pendientes</p>
-                        <p className="font-heading text-lg text-[#C27A29] font-bold">{report.quote_funnel.pending_quotes}</p>
-                      </div>
-                      <div className="bg-[#501122]/10 rounded-xl p-2.5 border border-[#501122]/20">
-                        <p className="text-[10px] uppercase font-bold text-[#501122]">Ingreso Aportado</p>
-                        <p className="font-heading text-base text-[#501122] font-bold">{formatUSD(report.quote_funnel.revenue_from_quotes)}</p>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1 pt-2 border-t border-[#501122]/5">
-                      <div className="flex justify-between text-xs font-semibold">
-                        <span className="text-[#501122]">Tasa de Cierre de Ventas</span>
-                        <span className="text-[#3F634A] font-bold">{report.quote_funnel.conversion_rate}% Éxito</span>
-                      </div>
-                      <div className="h-2.5 w-full bg-[#F0E4D8] rounded-full overflow-hidden">
-                        <div className="h-full bg-[#3F634A] rounded-full transition-all duration-500" style={{ width: `${report.quote_funnel.conversion_rate}%` }}></div>
-                      </div>
-                    </div>
-                  </div>
-                )}
               </div>
 
               {/* Charts - Always Visible Labels (NO HOVER NEEDED) */}
               {/* Daily Sales Trend Chart */}
-              {report.daily_chart.length > 0 && (
-                <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-4">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <p className="font-heading text-xl text-[#501122] flex items-center gap-2">
-                        <TrendingUp className="h-5 w-5 text-[#3F634A]" />Evolución de Ingresos por Día ($)
-                      </p>
-                      <p className="text-xs text-[#78686C]">Monto recaudado cada día. Los montos se muestran permanentemente en las barras.</p>
-                    </div>
-                    <span className="bg-[#3F634A]/10 text-[#3F634A] text-xs font-bold px-3 py-1 rounded-full">
-                      Valores Continuos Imprimidos
-                    </span>
-                  </div>
-
-                  <ResponsiveContainer width="100%" height={240}>
-                    <BarChart data={report.daily_chart} margin={{ top: 25, right: 10, left: 10, bottom: 5 }}>
-                      <XAxis dataKey="date" tick={{ fill: '#501122', fontSize: 11, fontWeight: 600 }} tickFormatter={v => {
-                        const parts = v.split('-');
-                        return `${parts[2]}/${parts[1]}`;
-                      }} axisLine={{ stroke: '#501122', strokeOpacity: 0.1 }} tickLine={false} />
-                      <YAxis tick={{ fill: '#78686C', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v}`} />
-                      <Bar dataKey="revenue" fill="#3F634A" radius={[10, 10, 0, 0]} name="Ingresos USD">
-                        <LabelList dataKey="revenue" position="top" formatter={(v) => v > 0 ? `$${v.toFixed(0)}` : ''} style={{ fill: '#3F634A', fontSize: 12, fontWeight: 700, fontFamily: 'Outfit' }} />
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-
-                  {/* Explicit Permanent Legend List */}
-                  <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2 pt-3 border-t border-[#501122]/5 text-center">
-                    {report.daily_chart.map(item => (
-                      <div key={item.date} className="bg-[#F3EBE0]/60 rounded-xl p-2">
-                        <p className="text-[10px] font-bold text-[#78686C] uppercase">{item.date.slice(5)}</p>
-                        <p className="font-heading text-sm text-[#3F634A] font-bold">{formatUSD(item.revenue)}</p>
-                        <p className="text-[9px] text-[#501122]">{item.orders} ped.</p>
+              {((report?.daily_chart && report.daily_chart.length > 0) || loadingReport) && (
+                <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-4 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`}>
+                  {loadingReport ? (
+                    <div className="space-y-4">
+                      {/* Header skeleton */}
+                      <div className="space-y-2">
+                        <div className="h-5 bg-[#501122]/10 rounded w-1/3"></div>
+                        <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
                       </div>
-                    ))}
-                  </div>
+                      {/* Simulated Chart Silhouette bars */}
+                      <div className="flex items-end justify-between h-[240px] pt-10 px-4 border-b border-[#501122]/10">
+                        <div className="w-[8%] bg-[#3F634A]/5 rounded-t-lg h-[20%]"></div>
+                        <div className="w-[8%] bg-[#3F634A]/10 rounded-t-lg h-[45%]"></div>
+                        <div className="w-[8%] bg-[#3F634A]/20 rounded-t-lg h-[70%]"></div>
+                        <div className="w-[8%] bg-[#3F634A]/5 rounded-t-lg h-[30%]"></div>
+                        <div className="w-[8%] bg-[#3F634A]/15 rounded-t-lg h-[85%]"></div>
+                        <div className="w-[8%] bg-[#3F634A]/10 rounded-t-lg h-[60%]"></div>
+                        <div className="w-[8%] bg-[#3F634A]/5 rounded-t-lg h-[40%]"></div>
+                      </div>
+                      {/* Legend skeleton */}
+                      <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2 pt-3 border-t border-[#501122]/5 text-center">
+                        {[...Array(7)].map((_, i) => (
+                          <div key={i} className="bg-[#F3EBE0]/30 rounded-xl p-2 space-y-1.5">
+                            <div className="h-2.5 bg-[#501122]/10 rounded mx-auto w-2/3"></div>
+                            <div className="h-4 bg-[#501122]/10 rounded mx-auto w-1/2"></div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <p className="font-heading text-xl text-[#501122] flex items-center gap-2">
+                            <TrendingUp className="h-5 w-5 text-[#3F634A]" />Evolución de Ingresos por Día ($)
+                          </p>
+                          <p className="text-xs text-[#78686C]">Monto recaudado cada día. Los montos se muestran permanentemente en las barras.</p>
+                        </div>
+                        <span className="bg-[#3F634A]/10 text-[#3F634A] text-xs font-bold px-3 py-1 rounded-full">
+                          Valores Continuos Imprimidos
+                        </span>
+                      </div>
+
+                      <ResponsiveContainer width="100%" height={240}>
+                        <BarChart data={report?.daily_chart || []} margin={{ top: 25, right: 10, left: 10, bottom: 5 }}>
+                          <XAxis dataKey="date" tick={{ fill: '#501122', fontSize: 11, fontWeight: 600 }} tickFormatter={v => {
+                            const parts = (v || '').split('-');
+                            return parts.length === 3 ? `${parts[2]}/${parts[1]}` : (v || '');
+                          }} axisLine={{ stroke: '#501122', strokeOpacity: 0.1 }} tickLine={false} />
+                          <YAxis tick={{ fill: '#78686C', fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={v => `$${v}`} />
+                          <Bar dataKey="revenue" fill="#3F634A" radius={[10, 10, 0, 0]} name="Ingresos USD">
+                            <LabelList dataKey="revenue" position="top" formatter={(v) => typeof v === 'number' && v > 0 ? `$${v.toFixed(0)}` : ''} style={{ fill: '#3F634A', fontSize: 12, fontWeight: 700, fontFamily: 'Outfit' }} />
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+
+                      {/* Explicit Permanent Legend List */}
+                      <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2 pt-3 border-t border-[#501122]/5 text-center">
+                        {(report?.daily_chart || []).map(item => (
+                          <div key={item.date} className="bg-[#F3EBE0]/60 rounded-xl p-2">
+                            <p className="text-[10px] font-bold text-[#78686C] uppercase">{(item.date || '').slice(5)}</p>
+                            <p className="font-heading text-sm text-[#3F634A] font-bold">{formatUSD(item.revenue)}</p>
+                            <p className="text-[9px] text-[#501122]">{item.orders} ped.</p>
+                            <p className="font-heading text-sm text-[#3F634A] font-bold">{formatUSD(item.revenue)}</p>
+                            <p className="text-[9px] text-[#501122]">{item.orders} ped.</p>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 
               {/* Peak Hours & Orders per Day (2 Columns) */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                 {/* Orders per day chart */}
-                {report.daily_chart.length > 0 && (
-                  <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3">
-                    <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
-                      <Package className="h-5 w-5 text-[#501122]" />Cantidad de Pedidos por Día
-                    </p>
-                    <p className="text-xs text-[#78686C]">Número de órdenes atendidas diariamente (etiquetas siempre visibles)</p>
-                    <ResponsiveContainer width="100%" height={210}>
-                      <BarChart data={report.daily_chart} margin={{ top: 25, right: 10, left: 10, bottom: 5 }}>
-                        <XAxis dataKey="date" tick={{ fill: '#501122', fontSize: 10, fontWeight: 600 }} tickFormatter={v => v.slice(5)} axisLine={false} tickLine={false} />
-                        <YAxis tick={{ fill: '#78686C', fontSize: 10 }} allowDecimals={false} axisLine={false} tickLine={false} />
-                        <Bar dataKey="orders" fill="#501122" radius={[8, 8, 0, 0]} name="Pedidos">
-                          <LabelList dataKey="orders" position="top" formatter={(v) => v > 0 ? `${v}` : ''} style={{ fill: '#501122', fontSize: 12, fontWeight: 700, fontFamily: 'Outfit' }} />
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
+                {(report.daily_chart.length > 0 || loadingReport) && (
+                  <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`}>
+                    {loadingReport ? (
+                      <div className="space-y-4">
+                        {/* Header skeleton */}
+                        <div className="space-y-2">
+                          <div className="h-5 bg-[#501122]/10 rounded w-1/2"></div>
+                          <div className="h-3 bg-[#501122]/10 rounded w-2/3"></div>
+                        </div>
+                        <div className="flex items-end justify-between h-[210px] pt-10 px-4 border-b border-[#501122]/10">
+                          <div className="w-[10%] bg-[#501122]/5 rounded-t-lg h-[40%]"></div>
+                          <div className="w-[10%] bg-[#501122]/15 rounded-t-lg h-[75%]"></div>
+                          <div className="w-[10%] bg-[#501122]/10 rounded-t-lg h-[50%]"></div>
+                          <div className="w-[10%] bg-[#501122]/20 rounded-t-lg h-[90%]"></div>
+                          <div className="w-[10%] bg-[#501122]/5 rounded-t-lg h-[30%]"></div>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
+                          <Package className="h-5 w-5 text-[#501122]" />Cantidad de Pedidos por Día
+                        </p>
+                        <p className="text-xs text-[#78686C]">Número de órdenes atendidas diariamente (etiquetas siempre visibles)</p>
+                        <ResponsiveContainer width="100%" height={210}>
+                          <BarChart data={report.daily_chart} margin={{ top: 25, right: 10, left: 10, bottom: 5 }}>
+                            <XAxis dataKey="date" tick={{ fill: '#501122', fontSize: 10, fontWeight: 600 }} tickFormatter={v => v.slice(5)} axisLine={false} tickLine={false} />
+                            <YAxis tick={{ fill: '#78686C', fontSize: 10 }} allowDecimals={false} axisLine={false} tickLine={false} />
+                            <Bar dataKey="orders" fill="#501122" radius={[8, 8, 0, 0]} name="Pedidos">
+                              <LabelList dataKey="orders" position="top" formatter={(v) => v > 0 ? `${v}` : ''} style={{ fill: '#501122', fontSize: 12, fontWeight: 700, fontFamily: 'Outfit' }} />
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </>
+                    )}
                   </div>
                 )}
 
                 {/* Peak Hours Distribution */}
-                {report.peak_hours.some(h => h.orders > 0) && (
-                  <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
-                          <Clock className="h-5 w-5 text-[#C27A29]" />Horas Pico de Pedidos
-                        </p>
-                        <p className="text-xs text-[#78686C]">Distribución horaria con conteo visible en cada barra</p>
+                {(report.peak_hours.some(h => h.orders > 0) || loadingReport) && (
+                  <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`}>
+                    {loadingReport ? (
+                      <div className="space-y-4">
+                        {/* Header skeleton */}
+                        <div className="space-y-2">
+                          <div className="h-5 bg-[#501122]/10 rounded w-1/2"></div>
+                          <div className="h-3 bg-[#501122]/10 rounded w-2/3"></div>
+                        </div>
+                        <div className="flex items-end justify-between h-[210px] pt-10 px-4 border-b border-[#501122]/10">
+                          <div className="w-[6%] bg-[#C27A29]/5 rounded-t h-[15%]"></div>
+                          <div className="w-[6%] bg-[#C27A29]/5 rounded-t h-[30%]"></div>
+                          <div className="w-[6%] bg-[#C27A29]/15 rounded-t h-[65%]"></div>
+                          <div className="w-[6%] bg-[#C27A29]/10 rounded-t h-[80%]"></div>
+                          <div className="w-[6%] bg-[#C27A29]/5 rounded-t h-[40%]"></div>
+                          <div className="w-[6%] bg-[#C27A29]/20 rounded-t h-[95%]"></div>
+                          <div className="w-[6%] bg-[#C27A29]/5 rounded-t h-[50%]"></div>
+                        </div>
                       </div>
-                      <span className="bg-amber-100 text-amber-900 text-[10px] font-bold px-2.5 py-1 rounded-full">
-                        {report.peak_hour}
-                      </span>
-                    </div>
+                    ) : (
+                      <>
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
+                              <Clock className="h-5 w-5 text-[#C27A29]" />Horas Pico de Pedidos
+                            </p>
+                            <p className="text-xs text-[#78686C]">Distribución horaria con conteo visible en cada barra</p>
+                          </div>
+                          <span className="bg-amber-100 text-amber-900 text-[10px] font-bold px-2.5 py-1 rounded-full">
+                            {report.peak_hour}
+                          </span>
+                        </div>
 
-                    <ResponsiveContainer width="100%" height={210}>
-                      <BarChart data={report.peak_hours.filter((_, i) => i >= 8 && i <= 22)} margin={{ top: 25, right: 5, left: 5, bottom: 5 }}>
-                        <XAxis dataKey="hour" tick={{ fill: '#78686C', fontSize: 9 }} tickFormatter={v => v.replace(':00', 'h')} axisLine={false} tickLine={false} />
-                        <YAxis tick={{ fill: '#78686C', fontSize: 10 }} allowDecimals={false} axisLine={false} tickLine={false} />
-                        <Bar dataKey="orders" fill="#C27A29" radius={[8, 8, 0, 0]} name="Pedidos">
-                          <LabelList dataKey="orders" position="top" formatter={(v) => v > 0 ? v : ''} style={{ fill: '#C27A29', fontSize: 11, fontWeight: 700, fontFamily: 'Outfit' }} />
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
+                        <ResponsiveContainer width="100%" height={210}>
+                          <BarChart data={report.peak_hours.filter((_, i) => i >= 8 && i <= 22)} margin={{ top: 25, right: 5, left: 5, bottom: 5 }}>
+                            <XAxis dataKey="hour" tick={{ fill: '#78686C', fontSize: 9 }} tickFormatter={v => v.replace(':00', 'h')} axisLine={false} tickLine={false} />
+                            <YAxis tick={{ fill: '#78686C', fontSize: 10 }} allowDecimals={false} axisLine={false} tickLine={false} />
+                            <Bar dataKey="orders" fill="#C27A29" radius={[8, 8, 0, 0]} name="Pedidos">
+                              <LabelList dataKey="orders" position="top" formatter={(v) => v > 0 ? v : ''} style={{ fill: '#C27A29', fontSize: 11, fontWeight: 700, fontFamily: 'Outfit' }} />
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -1084,70 +1470,118 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
               {/* Top Flavors + Status Breakdown Grid */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                 {/* Top Flavors */}
-                {report.top_flavors.length > 0 && (
-                  <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-4">
-                    <div>
-                      <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
-                        <IceCream2 className="h-5 w-5 text-[#501122]" />Sabores Más Vendidos
-                      </p>
-                      <p className="text-xs text-[#78686C]">Porciones vendidas, % de cuota e ingresos generados</p>
-                    </div>
-
-                    <div className="space-y-3">
-                      {report.top_flavors.map((f, i) => (
-                        <div key={f.name} className="space-y-1">
-                          <div className="flex items-center justify-between text-xs font-semibold">
-                            <span className="text-[#501122] flex items-center gap-2">
-                              <span className="w-5 h-5 rounded-full bg-[#501122]/10 text-[#501122] text-[10px] flex items-center justify-center font-bold">{i + 1}</span>
-                              {f.name}
-                            </span>
-                            <span className="text-[#3F634A] font-bold">
-                              {f.quantity} porciones &middot; {formatUSD(f.revenue || 0)} ({f.percentage}%)
-                            </span>
-                          </div>
-                          <div className="h-2.5 w-full bg-[#F0E4D8] rounded-full overflow-hidden">
-                            <div className="h-full rounded-full transition-all duration-500" style={{ width: `${f.percentage}%`, backgroundColor: f.color || '#501122' }}></div>
-                          </div>
+                {(report.top_flavors.length > 0 || loadingReport) && (
+                  <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-4 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`}>
+                    {loadingReport ? (
+                      <div className="space-y-4">
+                        {/* Header skeleton */}
+                        <div className="space-y-2">
+                          <div className="h-5 bg-[#501122]/10 rounded w-1/3"></div>
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
                         </div>
-                      ))}
-                    </div>
+                        <div className="space-y-4 pt-2">
+                          {[1, 2, 3, 4].map((i) => (
+                            <div key={i} className="space-y-2">
+                              <div className="flex justify-between items-center">
+                                <div className="h-3.5 bg-[#501122]/10 rounded w-1/3"></div>
+                                <div className="h-3.5 bg-[#501122]/10 rounded w-1/4"></div>
+                              </div>
+                              <div className="h-2.5 bg-[#501122]/5 rounded-full w-full"></div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <div>
+                          <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
+                            <IceCream2 className="h-5 w-5 text-[#501122]" />Sabores Más Vendidos
+                          </p>
+                          <p className="text-xs text-[#78686C]">Porciones vendidas, % de cuota e ingresos generados</p>
+                        </div>
+
+                        <div className="space-y-3">
+                          {report.top_flavors.map((f, i) => (
+                            <div key={f.name} className="space-y-1">
+                              <div className="flex items-center justify-between text-xs font-semibold">
+                                <span className="text-[#501122] flex items-center gap-2">
+                                  <span className="w-5 h-5 rounded-full bg-[#501122]/10 text-[#501122] text-[10px] flex items-center justify-center font-bold">{i + 1}</span>
+                                  {f.name}
+                                </span>
+                                <span className="text-[#3F634A] font-bold">
+                                  {f.quantity} porciones &middot; {formatUSD(f.revenue || 0)} ({f.percentage}%)
+                                </span>
+                              </div>
+                              <div className="h-2.5 w-full bg-[#F0E4D8] rounded-full overflow-hidden">
+                                <div className="h-full rounded-full transition-all duration-500" style={{ width: `${f.percentage}%`, backgroundColor: f.color || '#501122' }}></div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
 
                 {/* Status Breakdown (Donut + Static Legend Grid) */}
-                {report.status_breakdown.length > 0 && (
-                  <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-4">
-                    <div>
-                      <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
-                        <PackageCheck className="h-5 w-5 text-[#3F634A]" />Estado de los Pedidos
-                      </p>
-                      <p className="text-xs text-[#78686C]">Distribución por estado actual (todas las cifras expuestas)</p>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 items-center gap-4">
-                      <ResponsiveContainer width="100%" height={170}>
-                        <PieChart>
-                          <Pie data={report.status_breakdown} dataKey="count" nameKey="label" cx="50%" cy="50%" innerRadius={42} outerRadius={70} paddingAngle={4}>
-                            {report.status_breakdown.map((s) => <Cell key={s.status} fill={s.color || '#501122'} />)}
-                          </Pie>
-                        </PieChart>
-                      </ResponsiveContainer>
-
-                      {/* Always Visible Legend Table */}
-                      <div className="space-y-2">
-                        {report.status_breakdown.map((s) => (
-                          <div key={s.status} className="flex items-center justify-between bg-[#F3EBE0]/50 p-2 rounded-xl border border-[#501122]/5 text-xs">
-                            <div className="flex items-center gap-2">
-                              <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: s.color || '#501122' }}></span>
-                              <span className="font-semibold text-[#501122]">{s.label || statusLabels[s.status] || s.status}</span>
-                            </div>
-                            <span className="font-heading text-sm text-[#501122] font-bold">
-                              {s.count} <span className="text-[10px] text-[#78686C]">({s.percentage}%)</span>
-                            </span>
+                {(report.status_breakdown.length > 0 || loadingReport) && (
+                  <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-6 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-4 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`}>
+                    {loadingReport ? (
+                      <div className="space-y-4">
+                        {/* Header skeleton */}
+                        <div className="space-y-2">
+                          <div className="h-5 bg-[#501122]/10 rounded w-1/3"></div>
+                          <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 items-center gap-4 pt-2">
+                          <div className="relative w-36 h-36 mx-auto rounded-full border-[10px] border-[#3F634A]/10 flex items-center justify-center">
+                            <div className="w-20 h-20 rounded-full bg-white border border-[#3F634A]/5"></div>
                           </div>
-                        ))}
+                          <div className="space-y-2.5">
+                            {[1, 2, 3, 4].map((i) => (
+                              <div key={i} className="flex justify-between items-center bg-[#F3EBE0]/30 p-2.5 rounded-xl border border-[#501122]/5">
+                                <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
+                                <div className="h-3 bg-[#501122]/15 rounded w-1/6"></div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
                       </div>
-                    </div>
+                    ) : (
+                      <>
+                        <div>
+                          <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
+                            <PackageCheck className="h-5 w-5 text-[#3F634A]" />Estado de los Pedidos
+                          </p>
+                          <p className="text-xs text-[#78686C]">Distribución por estado actual (todas las cifras expuestas)</p>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 items-center gap-4">
+                          <ResponsiveContainer width="100%" height={170}>
+                            <PieChart>
+                              <Pie data={report.status_breakdown} dataKey="count" nameKey="label" cx="50%" cy="50%" innerRadius={42} outerRadius={70} paddingAngle={4}>
+                                {report.status_breakdown.map((s) => <Cell key={s.status} fill={s.color || '#501122'} />)}
+                              </Pie>
+                            </PieChart>
+                          </ResponsiveContainer>
+
+                          {/* Always Visible Legend Table */}
+                          <div className="space-y-2">
+                            {report.status_breakdown.map((s) => (
+                              <div key={s.status} className="flex items-center justify-between bg-[#F3EBE0]/50 p-2 rounded-xl border border-[#501122]/5 text-xs">
+                                <div className="flex items-center gap-2">
+                                  <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: s.color || '#501122' }}></span>
+                                  <span className="font-semibold text-[#501122]">{s.label || statusLabels[s.status] || s.status}</span>
+                                </div>
+                                <span className="font-heading text-sm text-[#501122] font-bold">
+                                  {s.count} <span className="text-[10px] text-[#78686C]">({s.percentage}%)</span>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -1155,172 +1589,236 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
               {/* Top Customers + Delivery Performance */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                 {/* Top Customers */}
-                {report.top_customers.length > 0 && (
-                  <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3">
-                    <p className="font-heading text-lg text-[#501122] flex items-center gap-2"><Award className="h-5 w-5 text-amber-600" />Top Clientes del Período</p>
-                    <div className="space-y-2">
-                      {report.top_customers.map((c, i) => (
-                        <div key={c.id || c.name} className="flex items-center gap-3 p-2.5 rounded-2xl bg-[#F3EBE0]/40 border border-[#501122]/5">
-                          <span className="w-8 h-8 rounded-full bg-[#501122] text-white flex items-center justify-center text-xs font-bold shrink-0">{i + 1}</span>
-                          <div className="flex-1 min-w-0">
-                            <p className="font-bold text-[#501122] text-sm truncate">{c.name}</p>
-                            <p className="text-[10px] text-[#78686C]">{c.orders} pedidos realizdos &middot; {c.phone}</p>
-                          </div>
-                          <div className="text-right">
-                            <p className="font-heading text-base text-[#3F634A] font-bold">{formatUSD(c.revenue)}</p>
-                            <p className="text-[9px] text-[#78686C]">{formatVES(c.revenue, rate)}</p>
-                          </div>
+                {(report.top_customers.length > 0 || loadingReport) && (
+                  <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`}>
+                    {loadingReport ? (
+                      <div className="space-y-3">
+                        {/* Header skeleton */}
+                        <div className="h-5 bg-[#501122]/10 rounded w-1/2"></div>
+                        <div className="space-y-2 pt-2">
+                          {[1, 2, 3].map((i) => (
+                            <div key={i} className="flex items-center gap-3 p-2.5 rounded-2xl bg-[#F3EBE0]/30 border border-[#501122]/5">
+                              <span className="w-8 h-8 rounded-full bg-[#501122]/10 shrink-0"></span>
+                              <div className="flex-1 space-y-1.5 min-w-0">
+                                <div className="h-3.5 bg-[#501122]/10 rounded w-1/2"></div>
+                                <div className="h-2.5 bg-[#501122]/10 rounded w-2/3"></div>
+                              </div>
+                              <div className="space-y-1.5">
+                                <div className="h-4 bg-[#3F634A]/10 rounded w-12 ml-auto"></div>
+                                <div className="h-2.5 bg-[#501122]/10 rounded w-16 ml-auto"></div>
+                              </div>
+                            </div>
+                          ))}
                         </div>
-                      ))}
-                    </div>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="font-heading text-lg text-[#501122] flex items-center gap-2"><Award className="h-5 w-5 text-amber-600" />Top Clientes del Período</p>
+                        <div className="space-y-2">
+                          {report.top_customers.map((c, i) => (
+                            <div key={c.id || c.name} className="flex items-center gap-3 p-2.5 rounded-2xl bg-[#F3EBE0]/40 border border-[#501122]/5">
+                              <span className="w-8 h-8 rounded-full bg-[#501122] text-white flex items-center justify-center text-xs font-bold shrink-0">{i + 1}</span>
+                              <div className="flex-1 min-w-0">
+                                <p className="font-bold text-[#501122] text-sm truncate">{c.name}</p>
+                                <p className="text-[10px] text-[#78686C]">{c.orders} pedidos realizdos &middot; {c.phone}</p>
+                              </div>
+                              <div className="text-right">
+                                <p className="font-heading text-base text-[#3F634A] font-bold">{formatUSD(c.revenue)}</p>
+                                <p className="text-[9px] text-[#78686C]">{formatVES(c.revenue, rate)}</p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
 
                 {/* Delivery Driver Performance */}
-                {report.delivery_ranking.length > 0 && (
-                  <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3" data-testid="delivery-ranking-card">
-                    {(() => {
-                      const totalEarn = report.delivery_ranking.reduce((s, d) => s + (d.earnings || 0), 0);
-                      const totalDel = report.delivery_ranking.reduce((s, d) => s + (d.delivered || 0), 0);
-                      const totalKm = report.delivery_ranking.reduce((s, d) => s + (d.km_delivered || 0), 0);
-                      return (
+                {(report.delivery_ranking.length > 0 || loadingReport) && (
+                  <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`} data-testid="delivery-ranking-card">
+                    {loadingReport ? (
+                      <div className="space-y-4">
+                        {/* Header skeleton */}
                         <div className="flex items-center justify-between gap-3">
-                          <p className="font-heading text-lg text-[#501122] flex items-center gap-2"><Truck className="h-5 w-5 text-[#3F634A]" />Rendimiento Repartidores</p>
-                          <div className="text-right" data-testid="delivery-ranking-total">
-                            <span className="text-xs font-bold text-[#3F634A] bg-[#3F634A]/10 px-2.5 py-1 rounded-full">
-                              Ganado: {formatUSD(totalEarn)} ({totalDel} entregas)
-                            </span>
-                          </div>
+                          <div className="h-5 bg-[#501122]/10 rounded w-1/2"></div>
+                          <div className="h-5 bg-[#3F634A]/10 rounded-full w-1/3"></div>
                         </div>
-                      );
-                    })()}
-
-                    <div className="space-y-2.5">
-                      {report.delivery_ranking.map((d, i) => (
-                        <div key={d.id || d.name} className="p-3 rounded-2xl bg-[#F3EBE0]/40 border border-[#501122]/5 space-y-2" data-testid={`delivery-row-${i}`}>
-                          <div className="flex items-center justify-between gap-3">
-                            <div className="flex items-center gap-2.5">
-                              <div className="w-9 h-9 rounded-full bg-[#3F634A] text-white flex items-center justify-center font-heading font-bold text-xs">
-                                {(d.name || '?')[0]}
+                        <div className="space-y-2.5 pt-2">
+                          {[1, 2].map((i) => (
+                            <div key={i} className="p-3 rounded-2xl bg-[#F3EBE0]/30 border border-[#501122]/5 space-y-2">
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="flex items-center gap-2.5">
+                                  <div className="w-9 h-9 rounded-full bg-[#3F634A]/10 shrink-0"></div>
+                                  <div className="space-y-1.5 flex-1 min-w-0">
+                                    <div className="h-3.5 bg-[#501122]/10 rounded w-24"></div>
+                                    <div className="h-2.5 bg-[#501122]/10 rounded w-36"></div>
+                                  </div>
+                                </div>
+                                <div className="space-y-1">
+                                  <div className="h-2.5 bg-[#78686C]/10 rounded w-10 ml-auto"></div>
+                                  <div className="h-4 bg-[#3F634A]/10 rounded w-14 ml-auto"></div>
+                                </div>
                               </div>
-                              <div>
-                                <p className="font-bold text-[#501122] text-sm">{d.name}</p>
-                                <p className="text-[10px] text-[#78686C]">{d.delivered}/{d.total} entregados exitosos ({d.success_rate || Math.round(d.delivered / (d.total || 1) * 100)}%)</p>
+                              <div className="flex items-center justify-between pt-2 border-t border-[#501122]/5">
+                                <div className="h-3 bg-[#501122]/10 rounded w-1/3"></div>
+                                <div className="h-3 bg-[#501122]/10 rounded w-1/4"></div>
                               </div>
                             </div>
-                            <div className="text-right">
-                              <p className="text-[9px] uppercase tracking-wider text-[#78686C] font-semibold">Ganancia</p>
-                              <p className="font-heading text-base text-[#3F634A] font-bold" data-testid={`delivery-earnings-${i}`}>{formatUSD(d.earnings || 0)}</p>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center justify-between text-[11px] text-[#78686C] pt-2 border-t border-[#501122]/5">
-                            <span>Ventas generadas: <b className="text-[#501122]">{formatUSD(d.revenue)}</b></span>
-                            <span data-testid={`delivery-km-${i}`}>Distancia recorrida: <b className="text-[#501122]">{(d.km_delivered || 0).toFixed(1)} km</b></span>
-                          </div>
+                          ))}
                         </div>
-                      ))}
-                    </div>
+                      </div>
+                    ) : (
+                      <>
+                        {(() => {
+                          const totalEarn = report.delivery_ranking.reduce((s, d) => s + (d.earnings || 0), 0);
+                          const totalDel = report.delivery_ranking.reduce((s, d) => s + (d.delivered || 0), 0);
+                          return (
+                            <div className="flex items-center justify-between gap-3">
+                              <p className="font-heading text-lg text-[#501122] flex items-center gap-2"><Truck className="h-5 w-5 text-[#3F634A]" />Rendimiento Repartidores</p>
+                              <div className="text-right" data-testid="delivery-ranking-total">
+                                <span className="text-xs font-bold text-[#3F634A] bg-[#3F634A]/10 px-2.5 py-1 rounded-full">
+                                  Ganado: {formatUSD(totalEarn)} ({totalDel} entregas)
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })()}
+
+                        <div className="space-y-2.5">
+                          {report.delivery_ranking.map((d, i) => (
+                            <div key={d.id || d.name} className="p-3 rounded-2xl bg-[#F3EBE0]/40 border border-[#501122]/5 space-y-2" data-testid={`delivery-row-${i}`}>
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="flex items-center gap-2.5">
+                                  <div className="w-9 h-9 rounded-full bg-[#3F634A] text-white flex items-center justify-center font-heading font-bold text-xs">
+                                    {(d.name || '?')[0]}
+                                  </div>
+                                  <div>
+                                    <p className="font-bold text-[#501122] text-sm">{d.name}</p>
+                                    <p className="text-[10px] text-[#78686C]">{d.delivered}/{d.total} entregados exitosos ({d.success_rate || Math.round(d.delivered / (d.total || 1) * 100)}%)</p>
+                                  </div>
+                                </div>
+                                <div className="text-right">
+                                  <p className="text-[9px] uppercase tracking-wider text-[#78686C] font-semibold">Ganancia</p>
+                                  <p className="font-heading text-base text-[#3F634A] font-bold" data-testid={`delivery-earnings-${i}`}>{formatUSD(d.earnings || 0)}</p>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between text-[11px] text-[#78686C] pt-2 border-t border-[#501122]/5">
+                                <span>Ventas generadas: <b className="text-[#501122]">{formatUSD(d.revenue)}</b></span>
+                                <span data-testid={`delivery-km-${i}`}>Distancia recorrida: <b className="text-[#501122]">{(d.km_delivered || 0).toFixed(1)} km</b></span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
 
-              {/* Product Profitability Matrix + Customer Loyalty Cohorts */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-                {/* Product Matrix */}
-                {report.product_matrix && (
-                  <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3">
-                    <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
-                      <Layers className="h-5 w-5 text-[#C27A29]" />Matriz de Margen y Rotación por Producto
-                    </p>
-                    <p className="text-xs text-[#78686C]">Análisis de porciones vendidas, margen unitario e indicador de crecimiento</p>
+              {/* Customer Loyalty Cohorts */}
+              {(report.customer_cohorts || loadingReport) && (
+                <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`}>
+                  {loadingReport ? (
+                    <div className="space-y-4">
+                      {/* Header skeleton */}
+                      <div className="space-y-2">
+                        <div className="h-5 bg-[#501122]/10 rounded w-1/3"></div>
+                        <div className="h-3 bg-[#501122]/10 rounded w-1/2"></div>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2">
+                        <div className="h-24 bg-[#3F634A]/5 rounded-2xl animate-pulse"></div>
+                        <div className="h-24 bg-[#C27A29]/5 rounded-2xl animate-pulse"></div>
+                        <div className="h-24 bg-[#501122]/5 rounded-2xl animate-pulse"></div>
+                        <div className="h-24 bg-amber-100/20 rounded-2xl animate-pulse"></div>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
+                        <Repeat className="h-5 w-5 text-[#3F634A]" />Fidelización y Frecuencia de Compra
+                      </p>
+                      <p className="text-xs text-[#78686C]">Análisis de recompras, cohorte de clientes y valor promedio de vida (LTV)</p>
 
-                    <div className="space-y-2">
-                      {report.product_matrix.map(pm => (
-                        <div key={pm.name} className="flex items-center justify-between p-3 rounded-2xl bg-[#F3EBE0]/40 border border-[#501122]/5 text-xs">
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="font-bold text-[#501122]">{pm.name}</span>
-                              <span className="bg-[#501122]/10 text-[#501122] text-[10px] font-bold px-2 py-0.5 rounded-full">{pm.tag}</span>
-                            </div>
-                            <p className="text-[10px] text-[#78686C] mt-0.5">{pm.units} porciones &middot; ${pm.price.toFixed(2)} c/u &middot; Tendencia: <span className="text-emerald-700 font-semibold">{pm.trend}</span></p>
-                          </div>
-                          <div className="text-right">
-                            <p className="font-heading text-base font-bold text-[#3F634A]">{formatUSD(pm.revenue)}</p>
-                            <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded-full">
-                              ~{pm.margin_pct}% Margen
-                            </span>
-                          </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div className="bg-[#3F634A]/10 rounded-2xl p-3.5 border border-[#3F634A]/20">
+                          <p className="text-[10px] uppercase font-bold text-[#3F634A]">Clientes Recurrentes</p>
+                          <p className="font-heading text-2xl text-[#501122] font-bold">{report.customer_cohorts.repeat_count}</p>
+                          <p className="text-[10px] text-[#78686C] mt-0.5">Tasa de retención: {report.customer_cohorts.retention_rate}%</p>
                         </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
 
-                {/* Customer Cohorts & LTV */}
-                {report.customer_cohorts && (
-                  <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3">
-                    <p className="font-heading text-lg text-[#501122] flex items-center gap-2">
-                      <Repeat className="h-5 w-5 text-[#3F634A]" />Fidelización y Frecuencia de Compra
-                    </p>
-                    <p className="text-xs text-[#78686C]">Análisis de recompras, cohorte de clientes y valor promedio de vida (LTV)</p>
+                        <div className="bg-[#C27A29]/10 rounded-2xl p-3.5 border border-[#C27A29]/20">
+                          <p className="text-[10px] uppercase font-bold text-[#C27A29]">Frecuencia de Recompra</p>
+                          <p className="font-heading text-2xl text-[#501122] font-bold">Cada {report.customer_cohorts.avg_days_between_orders} días</p>
+                          <p className="text-[10px] text-[#78686C] mt-0.5">Intervalo prom. entre pedidos</p>
+                        </div>
 
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="bg-[#3F634A]/10 rounded-2xl p-3.5 border border-[#3F634A]/20">
-                        <p className="text-[10px] uppercase font-bold text-[#3F634A]">Clientes Recurrentes</p>
-                        <p className="font-heading text-2xl text-[#501122] font-bold">{report.customer_cohorts.repeat_count}</p>
-                        <p className="text-[10px] text-[#78686C] mt-0.5">Tasa de retención: {report.customer_cohorts.retention_rate}%</p>
+                        <div className="bg-[#501122]/10 rounded-2xl p-3.5 border border-[#501122]/20">
+                          <p className="text-[10px] uppercase font-bold text-[#501122]">LTV Promedio Cliente</p>
+                          <p className="font-heading text-xl text-[#501122] font-bold">{formatUSD(report.customer_cohorts.avg_customer_ltv)}</p>
+                          <p className="text-[10px] text-[#78686C] mt-0.5">Facturación histórica/cliente</p>
+                        </div>
+
+                        <div className="bg-amber-100/60 rounded-2xl p-3.5 border border-amber-200">
+                          <p className="text-[10px] uppercase font-bold text-amber-900">Clientes VIP (&gt;3 Pedidos)</p>
+                          <p className="font-heading text-2xl text-amber-900 font-bold">{report.customer_cohorts.vip_customers_count}</p>
+                          <p className="text-[10px] text-amber-800 mt-0.5">Clientes de alto valor constante</p>
+                        </div>
                       </div>
-
-                      <div className="bg-[#C27A29]/10 rounded-2xl p-3.5 border border-[#C27A29]/20">
-                        <p className="text-[10px] uppercase font-bold text-[#C27A29]">Frecuencia de Recompra</p>
-                        <p className="font-heading text-2xl text-[#501122] font-bold">Cada {report.customer_cohorts.avg_days_between_orders} días</p>
-                        <p className="text-[10px] text-[#78686C] mt-0.5">Intervalo prom. entre pedidos</p>
-                      </div>
-
-                      <div className="bg-[#501122]/10 rounded-2xl p-3.5 border border-[#501122]/20">
-                        <p className="text-[10px] uppercase font-bold text-[#501122]">LTV Promedio Cliente</p>
-                        <p className="font-heading text-xl text-[#501122] font-bold">{formatUSD(report.customer_cohorts.avg_customer_ltv)}</p>
-                        <p className="text-[10px] text-[#78686C] mt-0.5">Facturación histórica/cliente</p>
-                      </div>
-
-                      <div className="bg-amber-100/60 rounded-2xl p-3.5 border border-amber-200">
-                        <p className="text-[10px] uppercase font-bold text-amber-900">Clientes VIP (&gt;3 Pedidos)</p>
-                        <p className="font-heading text-2xl text-amber-900 font-bold">{report.customer_cohorts.vip_customers_count}</p>
-                        <p className="text-[10px] text-amber-800 mt-0.5">Clientes de alto valor constante</p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
+                    </>
+                  )}
+                </div>
+              )}
             </>
           )}
 
           {/* Top 5 Historical Days & Records */}
           {topDays.length > 0 && (
-            <div className="bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3" data-testid="top-days-card">
-              <div className="flex items-center justify-between">
-                <p className="font-heading text-lg text-[#501122] flex items-center gap-2"><Award className="h-5 w-5 text-amber-500" />Récords Históricos (Top 5 Mejores Días)</p>
-                <span className="text-xs font-semibold text-[#78686C]">Facturación histórica</span>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-2.5">
-                {topDays.map((d, i) => {
-                  const dateObj = new Date(`${d.date}T12:00:00`);
-                  const label = dateObj.toLocaleDateString('es-VE', { timeZone: 'America/Caracas', weekday: 'short', day: 'numeric', month: 'short' });
-                  const medals = ['bg-amber-400 text-amber-950', 'bg-slate-300 text-slate-900', 'bg-amber-700 text-white', 'bg-[#501122] text-white', 'bg-[#501122] text-white'];
-                  return (
-                    <div key={d.date} className="bg-[#F3EBE0]/60 rounded-2xl p-3 border border-[#501122]/5 text-center space-y-1" data-testid={`top-day-${i + 1}`}>
-                      <div className="flex items-center justify-center gap-1.5">
-                        <span className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold ${medals[i]}`}>#{i + 1}</span>
-                        <span className="text-xs font-bold text-[#501122] capitalize">{label}</span>
+            <div className={`bg-white rounded-[1.8rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3 transition-all duration-300 ${loadingReport ? 'shimmer-loading glow-card-loading' : ''}`} data-testid="top-days-card">
+              {loadingReport ? (
+                <div className="space-y-4">
+                  {/* Header skeleton */}
+                  <div className="flex items-center justify-between">
+                    <div className="h-5 bg-[#501122]/10 rounded w-1/2"></div>
+                    <div className="h-3.5 bg-[#78686C]/10 rounded w-20"></div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-2.5 pt-2">
+                    {[1, 2, 3, 4, 5].map((i) => (
+                      <div key={i} className="bg-[#F3EBE0]/30 rounded-2xl p-4 border border-[#501122]/5 text-center space-y-2 animate-pulse">
+                        <div className="h-4 bg-[#501122]/10 rounded w-3/4 mx-auto"></div>
+                        <div className="h-6 bg-[#3F634A]/10 rounded w-1/2 mx-auto"></div>
+                        <div className="h-2.5 bg-[#78686C]/10 rounded w-2/3 mx-auto"></div>
                       </div>
-                      <p className="font-heading text-lg text-[#3F634A] font-bold">{formatUSD(d.total)}</p>
-                      <p className="text-[9px] text-[#78686C]">{formatVES(d.total, rate)}</p>
-                    </div>
-                  );
-                })}
-              </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between">
+                    <p className="font-heading text-lg text-[#501122] flex items-center gap-2"><Award className="h-5 w-5 text-amber-500" />Récords Históricos (Top 5 Mejores Días)</p>
+                    <span className="text-xs font-semibold text-[#78686C]">Facturación histórica</span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-2.5">
+                    {topDays.map((d, i) => {
+                      const dateObj = new Date(`${d.date}T12:00:00`);
+                      const label = dateObj.toLocaleDateString('es-VE', { timeZone: 'America/Caracas', weekday: 'short', day: 'numeric', month: 'short' });
+                      const medals = ['bg-amber-400 text-amber-950', 'bg-slate-300 text-slate-900', 'bg-amber-700 text-white', 'bg-[#501122] text-white', 'bg-[#501122] text-white'];
+                      return (
+                        <div key={d.date} className="bg-[#F3EBE0]/60 rounded-2xl p-3 border border-[#501122]/5 text-center space-y-1" data-testid={`top-day-${i + 1}`}>
+                          <div className="flex items-center justify-center gap-1.5">
+                            <span className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold ${medals[i]}`}>#{i + 1}</span>
+                            <span className="text-xs font-bold text-[#501122] capitalize">{label}</span>
+                          </div>
+                          <p className="font-heading text-lg text-[#3F634A] font-bold">{formatUSD(d.total)}</p>
+                          <p className="text-[9px] text-[#78686C]">{formatVES(d.total, rate)}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -1509,9 +2007,25 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
       {activeSection === 'nuevo-pedido' && (
         <div className="space-y-5">
           {/* Unpaid banner */}
-          <OrderForm onSuccess={() => { loadAll(); loadQuotes(); setResumingQuote(null); }}
+          <OrderForm onSuccess={(newItem, removedQuoteId) => {
+            if (removedQuoteId) {
+              setQuotes(prev => prev.filter(q => q.id !== removedQuoteId));
+            }
+            if (newItem) {
+              if (newItem.is_quote) {
+                setQuotes(prev => [newItem, ...prev.filter(q => q.id !== newItem.id && !q.id.startsWith('temp_'))]);
+              } else {
+                setOrders(prev => [newItem, ...prev.filter(o => o.id !== newItem.id && !o.id.startsWith('temp_'))]);
+              }
+            }
+            setResumingQuote(null);
+            setSelectedCustomerForOrder(null);
+            loadFast();
+            loadQuotes();
+          }}
                      initialQuote={resumingQuote}
-                     onCancelQuote={() => setResumingQuote(null)} />
+                     initialCustomer={selectedCustomerForOrder}
+                     onCancelQuote={() => { setResumingQuote(null); setSelectedCustomerForOrder(null); }} />
 
           {/* Cotizaciones pendientes (solo cuando no se esta retomando una).
               Envuelto en lg:pr-[360px] para respetar el panel derecho fijo del OrderForm
@@ -1524,8 +2038,16 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-2 max-h-[380px] overflow-y-auto pr-1" data-testid="admin-quotes-grid">
               {quotes.map(q => {
                 const itemsTitle = q.items?.map(i => `${i.quantity}x ${i.flavor_name}`).join(', ') || 'Sin items';
+                const hasCustomer = q.customer_id && q.customer_name && q.customer_name !== '(Cotización sin cliente)';
+                const cardBgClass = hasCustomer ? 'bg-emerald-50 border-emerald-300' : 'bg-red-50 border-red-300';
+                const itemsTextClass = hasCustomer ? 'text-emerald-700' : 'text-red-700';
+                const priceTextClass = hasCustomer ? 'text-emerald-600' : 'text-red-600';
+                const metaTextClass = hasCustomer ? 'text-emerald-500/70' : 'text-red-500/70';
+                const buttonBgClass = hasCustomer ? 'bg-emerald-500 hover:bg-emerald-600' : 'bg-red-500 hover:bg-red-600';
+                const deleteBtnClass = hasCustomer ? 'text-emerald-500' : 'text-red-500';
+
                 return (
-                <div key={q.id} className="bg-red-50 border-2 border-red-300 rounded-2xl p-3 flex flex-col gap-2 min-w-0" data-testid={`admin-quote-${q.id}`}>
+                <div key={q.id} className={`border-2 rounded-2xl p-3 flex flex-col gap-2 min-w-0 ${cardBgClass}`} data-testid={`admin-quote-${q.id}`}>
                   <div className="min-w-0">
                     {q.customer_name && q.customer_name !== '(Cotización sin cliente)' && (
                       <p className="text-[11px] font-bold text-emerald-700 truncate flex items-center gap-1" title={q.customer_name}>
@@ -1537,15 +2059,15 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                         <FileText className="h-3 w-3 shrink-0" />{q.quote_description}
                       </p>
                     )}
-                    <p className="font-medium text-red-700 text-sm truncate" title={itemsTitle}>{itemsTitle}</p>
-                    <p className="text-[11px] font-semibold text-red-600">{formatUSD(q.total_usd)}</p>
-                    <p className="text-[10px] text-red-500/70 mt-0.5">{q.order_number} &middot; {formatDate(q.created_at)}</p>
+                    <p className={`font-medium text-sm truncate ${itemsTextClass}`} title={itemsTitle}>{itemsTitle}</p>
+                    <p className={`text-[11px] font-semibold ${priceTextClass}`}>{formatUSD(q.total_usd)}</p>
+                    <p className={`text-[10px] mt-0.5 ${metaTextClass}`}>{q.order_number} &middot; {formatDate(q.created_at)}</p>
                   </div>
                   <div className="flex gap-1.5">
-                    <Button size="sm" onClick={() => setResumingQuote(q)} className="bg-red-500 hover:bg-red-600 text-white h-8 rounded-full text-[11px] px-3 font-semibold flex-1" data-testid={`admin-resume-quote-${q.id}`}>
+                    <Button size="sm" onClick={() => setResumingQuote(q)} className={`text-white h-8 rounded-full text-[11px] px-3 font-semibold flex-1 ${buttonBgClass}`} data-testid={`admin-resume-quote-${q.id}`}>
                       Retomar
                     </Button>
-                    <Button size="sm" variant="ghost" onClick={() => deleteQuote(q.id)} className="text-red-500 h-8 rounded-full text-[11px] w-9 p-0" data-testid={`admin-delete-quote-${q.id}`}>
+                    <Button size="sm" variant="ghost" onClick={() => deleteQuote(q.id)} className={`h-8 rounded-full text-[11px] w-9 p-0 ${deleteBtnClass}`} data-testid={`admin-delete-quote-${q.id}`}>
                       <Trash2 className="h-3.5 w-3.5" />
                     </Button>
                   </div>
@@ -1568,7 +2090,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
               <div className="flex flex-wrap gap-1.5" data-testid="status-chips">
                 {STATUS_CHIPS.map(s => {
                   const active = Array.isArray(statusFilter) ? statusFilter.includes(s.id) : statusFilter === s.id;
-                  const visibleCount = (Array.isArray(orders) ? orders : []).filter(o => o.status !== 'sin_pagar').length;
+                  const visibleCount = (Array.isArray(orders) ? orders : []).filter(o => o.status !== 'sin_pagar' && (s.id === 'all' || o.status === s.id)).length;
                   const Icon = s.icon;
                   return (
                   <button key={s.id} onClick={() => toggleStatusFilter(s.id)} data-testid={`chip-${s.id}`}
@@ -1593,9 +2115,10 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
             </div>
             <div className="flex gap-1 bg-[#F0E4D8] rounded-full p-1" data-testid="order-type-filter">
               {[
-                { id: 'all', label: 'Ambos', icon: Package },
+                { id: 'all', label: 'Todos', icon: Package },
                 { id: 'delivery', label: 'Delivery', icon: Truck },
                 { id: 'pickup', label: 'Pickup', icon: ShoppingBag },
+                { id: 'tienda', label: 'Tienda', icon: Store },
               ].map(t => {
                 const active = typeFilter === t.id;
                 const Icon = t.icon;
@@ -1610,8 +2133,39 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
             </div>
           </div>
           <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 shadow-[0_8px_30px_rgba(80,17,34,0.03)] overflow-hidden">
-            {(() => { const ordersForList = (Array.isArray(orders) ? orders : []).filter(o => o.status !== 'sin_pagar' && (typeFilter === 'all' || o.order_type === typeFilter)); return ordersForList.length === 0 ? <p className="text-center py-16 text-[#78686C]">Sin pedidos</p> : (
-              <div className="divide-y divide-[#501122]/15">
+            {(() => {
+              const ordersForList = (Array.isArray(orders) ? orders : []).filter(o => {
+                if (o.status === 'sin_pagar') return false;
+
+                // Status chip filter
+                const isAllStatus = !statusFilter || statusFilter.includes('all') || statusFilter.length === 0;
+                if (!isAllStatus && !statusFilter.includes(o.status)) return false;
+
+                // Order type chip filter
+                if (typeFilter && typeFilter !== 'all' && o.order_type !== typeFilter) return false;
+
+                // Date range filter
+                if (dateFrom || dateTo) {
+                  const oDateStr = o.created_at || o.scheduled_for;
+                  if (oDateStr) {
+                    const d = new Date(oDateStr);
+                    if (dateFrom) {
+                      const start = new Date(dateFrom);
+                      start.setHours(0, 0, 0, 0);
+                      if (d < start) return false;
+                    }
+                    if (dateTo) {
+                      const end = new Date(dateTo);
+                      end.setHours(23, 59, 59, 999);
+                      if (d > end) return false;
+                    }
+                  }
+                }
+
+                return true;
+              });
+              return ordersForList.length === 0 ? <p className="text-center py-16 text-[#78686C]">Sin pedidos</p> : (
+              <div>
                 {ordersForList.slice(0, pedidosLimit).map(o => {
                   const gradientClass = {
                     pendiente: 'bg-gradient-to-l from-amber-300/45 via-white to-white',
@@ -1619,75 +2173,97 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                     entregado: 'bg-gradient-to-l from-[#3F634A]/35 via-white to-white',
                     cancelado: 'bg-gradient-to-l from-red-400/25 via-white to-white',
                   }[o.status] || '';
+                  const typeConfig = {
+                    tienda: { icon: Store, bg: 'bg-emerald-100 text-emerald-800 border-emerald-200', badgeBg: 'bg-emerald-100 text-emerald-800', border: '!border-l-4 !border-l-emerald-600', label: 'Tienda' },
+                    pickup: { icon: ShoppingBag, bg: 'bg-[#C27A29]/15 text-[#C27A29] border-[#C27A29]/30', badgeBg: 'bg-[#C27A29]/15 text-[#C27A29]', border: '!border-l-4 !border-l-amber-400', label: 'Pickup' },
+                    delivery: { icon: Truck, bg: 'bg-blue-100 text-blue-800 border-blue-200', badgeBg: 'bg-blue-50 text-blue-700', border: '!border-l-4 !border-l-blue-500', label: 'Delivery' },
+                  }[o.order_type] || { icon: Truck, bg: 'bg-blue-100 text-blue-800 border-blue-200', badgeBg: 'bg-blue-50 text-blue-700', border: '!border-l-4 !border-l-blue-500', label: 'Delivery' };
+                  const TypeIcon = typeConfig.icon;
+
                   return (
-                  <div key={o.id} className={`p-3 px-4 flex flex-col md:flex-row md:items-center gap-2 md:gap-4 relative ${gradientClass} ${o.order_type === 'pickup' ? 'border-l-4 border-amber-400' : ''}`}>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-heading text-[#501122] text-sm font-bold truncate">{o.customer_name}</span>
-                        <Badge className={`${statusColors[o.status]} rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 pointer-events-none hover:bg-current/0 shrink-0`}>{statusLabels[o.status]}</Badge>
-                        {o.order_type === 'pickup' && <Badge className="bg-[#C27A29]/15 text-[#C27A29] rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 pointer-events-none shrink-0"><ShoppingBag className="h-2.5 w-2.5 inline mr-0.5" />Pickup</Badge>}
-                        {o.created_by_name && <span className="text-[10px] text-[#78686C] shrink-0">por <span className="font-semibold text-[#501122]">{o.created_by_name}</span></span>}
+                  <div key={o.id} className={`p-3.5 px-4 flex flex-col md:flex-row md:items-center gap-3 relative min-h-[84px] border-t border-[#501122]/15 first:border-t-0 ${gradientClass} ${typeConfig.border}`}>
+                    <div className="flex items-start md:items-center gap-3 flex-1 min-w-0">
+                      {/* Icono al comienzo del pedido */}
+                      <div className={`p-2.5 rounded-2xl border flex items-center justify-center shrink-0 ${typeConfig.bg}`} title={`Tipo: ${typeConfig.label}`} data-testid={`order-type-icon-${o.id}`}>
+                        <TypeIcon className="h-4 w-4" />
                       </div>
-                      {o.wait_for_notice && (
-                        <p className="text-[11px] font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1 mt-0.5" data-testid={`order-wait-notice-sublabel-${o.id}`}>
-                          <Hourglass className="h-3 w-3 shrink-0 text-gray-500" />
-                          esperar aviso
-                        </p>
-                      )}
-                      <p className="text-xs text-[#78686C] mt-0.5">{o.items?.map(i => `${i.flavor_name} x${i.quantity}`).join(', ')}</p>
-                      {(o.notes || o.scheduled_for || o.wait_for_notice || o.velitas || o.receiver_name || o.receiver_phone) && (
-                        <div className="mt-1 flex flex-wrap gap-1" data-testid={`order-meta-${o.id}`}>
-                          {o.wait_for_notice && (
-                            <span className="text-[10px] text-gray-700 bg-gray-200/90 border border-gray-300/60 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Esperar aviso del cliente" data-testid={`order-wait-notice-meta-${o.id}`}>
-                              <Hourglass className="h-3 w-3 shrink-0" />
-                              <span className="font-bold">esperar aviso</span>
-                            </span>
-                          )}
-                          {o.scheduled_for && (
-                            <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Pedido programado" data-testid={`order-scheduled-${o.id}`}>
-                              <CalendarClock className="h-3 w-3 shrink-0" />
-                              <span className="font-semibold">Programado:</span>
-                              <span>{formatDate(o.scheduled_for)}</span>
-                            </span>
-                          )}
-                          {o.velitas && (
-                            <span className="text-[10px] text-[#C27A29] bg-[#C27A29]/10 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Requiere velitas" data-testid={`order-velitas-${o.id}`}>
-                              <Cake className="h-3 w-3 shrink-0" />
-                              <span className="font-semibold">Con velitas</span>
-                            </span>
-                          )}
-                          {(o.receiver_name || o.receiver_phone) && (
-                            <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1 max-w-full" title="Recibe otra persona" data-testid={`order-receiver-${o.id}`}>
-                              <UserRound className="h-3 w-3 shrink-0" />
-                              <span className="font-semibold">Recibe:</span>
-                              <span className="break-words">
-                                {o.receiver_name || ''}
-                                {o.receiver_name && o.receiver_phone ? ' · ' : ''}
-                                {o.receiver_phone || ''}
-                              </span>
-                            </span>
-                          )}
-                          {o.notes && (
-                            <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-start gap-1 max-w-full" data-testid={`order-notes-${o.id}`}>
-                              <FileText className="h-3 w-3 mt-0.5 shrink-0" />
-                              <span className="break-words">{o.notes}</span>
-                            </span>
-                          )}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-heading text-[#501122] text-sm font-bold truncate">{o.customer_name}</span>
+                          <Badge className={`${statusColors[o.status]} rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 pointer-events-none hover:bg-current/0 shrink-0`}>{statusLabels[o.status]}</Badge>
+                          <Badge className={`${typeConfig.badgeBg} rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0 pointer-events-none shrink-0`}>
+                            <TypeIcon className="h-2.5 w-2.5 inline mr-0.5" />{typeConfig.label}
+                          </Badge>
+                          {o.created_by_name && <span className="text-[10px] text-[#78686C] shrink-0">por <span className="font-semibold text-[#501122]">{o.created_by_name}</span></span>}
                         </div>
-                      )}
+                        {o.wait_for_notice && (
+                          <p className="text-[11px] font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1 mt-0.5" data-testid={`order-wait-notice-sublabel-${o.id}`}>
+                            <Hourglass className="h-3 w-3 shrink-0 text-gray-500" />
+                            esperar aviso
+                          </p>
+                        )}
+                        <p className="text-xs text-[#78686C] mt-0.5">{o.items?.map(i => `${i.flavor_name} x${i.quantity}`).join(', ')}</p>
+                        {(o.notes || o.scheduled_for || o.wait_for_notice || o.velitas || o.receiver_name || o.receiver_phone) && (
+                          <div className="mt-1 flex flex-wrap gap-1" data-testid={`order-meta-${o.id}`}>
+                            {o.wait_for_notice && (
+                              <span className="text-[10px] text-gray-700 bg-gray-200/90 border border-gray-300/60 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Esperar aviso del cliente" data-testid={`order-wait-notice-meta-${o.id}`}>
+                                <Hourglass className="h-3 w-3 shrink-0" />
+                                <span className="font-bold">esperar aviso</span>
+                              </span>
+                            )}
+                            {o.scheduled_for && (
+                              <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Pedido programado" data-testid={`order-scheduled-${o.id}`}>
+                                <CalendarClock className="h-3 w-3 shrink-0" />
+                                <span className="font-semibold">Programado:</span>
+                                <span>{formatDate(o.scheduled_for)}</span>
+                              </span>
+                            )}
+                            {o.velitas && (
+                              <span className="text-[10px] text-[#C27A29] bg-[#C27A29]/10 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1" title="Requiere velitas" data-testid={`order-velitas-${o.id}`}>
+                                <Cake className="h-3 w-3 shrink-0" />
+                                <span className="font-semibold">Con velitas</span>
+                              </span>
+                            )}
+                            {(o.receiver_name || o.receiver_phone) && (
+                              <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-center gap-1 max-w-full" title="Recibe otra persona" data-testid={`order-receiver-${o.id}`}>
+                                <UserRound className="h-3 w-3 shrink-0" />
+                                <span className="font-semibold">Recibe:</span>
+                                <span className="break-words">
+                                  {o.receiver_name || ''}
+                                  {o.receiver_name && o.receiver_phone ? ' · ' : ''}
+                                  {o.receiver_phone || ''}
+                                </span>
+                              </span>
+                            )}
+                            {o.notes && (
+                              <span className="text-[10px] text-[#501122] bg-[#F3EBE0]/80 rounded-md px-1.5 py-0.5 inline-flex items-start gap-1 max-w-full" data-testid={`order-notes-${o.id}`}>
+                                <FileText className="h-3 w-3 mt-0.5 shrink-0" />
+                                <span className="break-words">{o.notes}</span>
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     </div>
-                    <div className="flex items-center gap-3 md:gap-4 shrink-0">
-                      <div className="text-right text-[10px] space-y-0 relative">
+                    <div className="flex items-center gap-3 md:gap-4 shrink-0 justify-between md:justify-end border-t md:border-t-0 pt-2 md:pt-0 border-[#501122]/10">
+                      <div className="text-right text-[10px] space-y-0 relative shrink-0 min-w-[125px]">
                         <p><span className="text-[#78686C]">Producto:</span> <span className="font-semibold text-[#501122]">{formatUSD(o.items_total || 0)}</span> <span className="text-[#78686C]">/ {formatVES(o.items_total || 0, rate)}</span></p>
-                        {o.order_type !== 'pickup' && o.delivery_fee > 0 && (
-                          <p><span className="text-[#78686C]">Delivery:</span> <span className="font-semibold text-[#3F634A]">{formatUSD(o.delivery_fee || 0)}</span> <span className="text-[#78686C]">/ {formatVES(o.delivery_fee || 0, rate)}</span></p>
+                        {o.order_type === 'delivery' && (
+                          <p>
+                            <span className="text-[#78686C]">Delivery:</span>{' '}
+                            {o.delivery_fee > 0 ? (
+                              <><span className="font-semibold text-[#3F634A]">{formatUSD(o.delivery_fee || 0)}</span> <span className="text-[#78686C]">/ {formatVES(o.delivery_fee || 0, rate)}</span></>
+                            ) : (
+                              <span className="text-[#78686C]/70 font-medium">$0.00 (Gratis)</span>
+                            )}
+                          </p>
                         )}
                         <p className="pt-0.5 border-t border-[#501122]/10">
                           <span className="text-[#78686C] font-semibold">Total:</span> <span className="font-heading text-[#501122] text-sm">{formatUSD(o.total_usd)}</span> <span className="text-[#78686C]">/ {formatVES(o.total_usd, rate)}</span>
                         </p>
                       </div>
-                      <div className="hidden md:flex items-center gap-2">
-                        {o.order_type !== 'pickup' && ['pendiente', 'sin_pagar'].includes(o.status) ? (
+                      <div className="flex items-center gap-2 shrink-0 min-w-[110px] justify-end">
+                        {o.order_type === 'delivery' && ['pendiente', 'sin_pagar', 'en_camino'].includes(o.status) ? (
                           <Popover>
                             <PopoverTrigger asChild>
                               <button type="button" className="flex items-center gap-2 rounded-full hover:bg-[#F3EBE0]/60 transition-colors px-1 py-1" data-testid={`assign-delivery-btn-${o.id}`} title={o.delivery_id ? 'Cambiar delivery' : 'Asignar delivery'}>
@@ -1708,47 +2284,56 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                               <p className="text-[10px] uppercase tracking-wider text-[#78686C] font-semibold px-2 py-1">Elegir delivery</p>
                               <div className="max-h-64 overflow-y-auto space-y-1">
                                 {users.filter(u => u.role === 'delivery' && u.id !== o.delivery_id).map(u => (
-                                  <button key={u.id} type="button" onClick={() => assignDelivery(o.id, u.id)} className="w-full flex items-center gap-2 px-2 py-1.5 rounded-xl hover:bg-[#F3EBE0]/70 transition-colors text-left" data-testid={`assign-option-${o.id}-${u.id}`}>
-                                    <Avatar src={u.photo_data_url} name={u.name} size={32} />
-                                    <span className="text-sm text-[#501122] font-medium truncate">{u.name}</span>
-                                  </button>
+                                  <PopoverClose key={u.id} asChild>
+                                    <button type="button" onClick={() => assignDelivery(o.id, u.id)} className="w-full flex items-center gap-2 px-2 py-1.5 rounded-xl hover:bg-[#F3EBE0]/70 transition-colors text-left" data-testid={`assign-option-${o.id}-${u.id}`}>
+                                      <Avatar src={u.photo_data_url} name={u.name} size={32} />
+                                      <span className="text-sm text-[#501122] font-medium truncate">{u.name}</span>
+                                    </button>
+                                  </PopoverClose>
                                 ))}
                                 {users.filter(u => u.role === 'delivery' && u.id !== o.delivery_id).length === 0 && (
                                   <p className="text-xs text-[#78686C] px-2 py-2">No hay otros deliverys disponibles</p>
                                 )}
                                 {o.delivery_id && (
-                                  <button type="button" onClick={() => unassignDelivery(o.id)} className="w-full flex items-center gap-2 px-2 py-1.5 rounded-xl hover:bg-red-50 transition-colors text-left text-red-500" data-testid={`unassign-option-${o.id}`}>
-                                    <div className="w-8 h-8 rounded-full bg-red-100 flex items-center justify-center">
-                                      <Undo2 className="h-3.5 w-3.5" />
-                                    </div>
-                                    <span className="text-sm font-medium">Devolver a Disponibles</span>
-                                  </button>
+                                  <PopoverClose asChild>
+                                    <button type="button" onClick={() => unassignDelivery(o.id)} className="w-full flex items-center gap-2 px-2 py-1.5 rounded-xl hover:bg-red-50 transition-colors text-left text-red-500" data-testid={`unassign-option-${o.id}`}>
+                                      <div className="w-8 h-8 rounded-full bg-red-100 flex items-center justify-center">
+                                        <Undo2 className="h-3.5 w-3.5" />
+                                      </div>
+                                      <span className="text-sm font-medium">Devolver a Disponibles</span>
+                                    </button>
+                                  </PopoverClose>
                                 )}
                               </div>
                             </PopoverContent>
                           </Popover>
                         ) : (
-                          <>
+                          <div className="flex items-center gap-2">
                             {o.delivery_id && (
-                              <Avatar src={o.delivery_photo_url} name={o.delivery_name} size={48} testId={`order-delivery-avatar-${o.id}`} />
+                              <Avatar src={o.delivery_photo_url} name={o.delivery_name} size={38} testId={`order-delivery-avatar-${o.id}`} />
                             )}
-                            <div className="text-right"><p className="text-[10px] text-[#78686C]">{o.delivery_name}</p><p className="text-[10px] text-[#78686C]">{formatDate(o.created_at)}</p></div>
-                          </>
+                            <div className="text-right">
+                              <p className="text-[10px] font-semibold text-[#501122] truncate max-w-[120px]">
+                                {o.delivery_name || (o.order_type === 'tienda' ? 'Venta en tienda' : o.order_type === 'pickup' ? 'Pickup en tienda' : 'Sin delivery')}
+                              </p>
+                              <p className="text-[10px] text-[#78686C]">{formatDate(o.created_at)}</p>
+                            </div>
+                          </div>
                         )}
                       </div>
-                      {['pendiente', 'sin_pagar'].includes(o.status) && (
-                        <button type="button" onClick={() => togglePrepared(o.id, !o.prepared)} data-testid={`prepared-toggle-${o.id}`}
-                          title={o.prepared ? `Preparado por ${o.prepared_by_name || '-'}` : 'Marcar como preparado'}
-                          className={`flex items-center justify-center h-8 w-8 rounded-full transition-all
-                            ${o.prepared ? 'bg-[#3F634A] text-white shadow-sm' : 'bg-white border border-[#501122]/15 text-[#78686C] hover:border-[#3F634A]/40 hover:text-[#3F634A]'}`}>
-                          <Check className="h-4 w-4" strokeWidth={3.5} />
+                      {(o.order_type === 'pickup' || o.order_type === 'tienda') && o.status === 'pendiente' && (
+                        <button type="button" onClick={() => updateStatus(o.id, 'entregado')} data-testid={`admin-pickup-deliver-inline-${o.id}`}
+                          title="Marcar como Entregado"
+                          className="flex items-center gap-1 h-8 px-3 rounded-full bg-[#3F634A] hover:bg-[#2E4A37] text-white text-[11px] font-bold uppercase tracking-wider shadow-sm shrink-0">
+                          <PackageCheck className="h-3.5 w-3.5" />Entregado
                         </button>
                       )}
-                      {o.order_type === 'pickup' && o.status === 'pendiente' && (
-                        <button type="button" onClick={() => updateStatus(o.id, 'entregado')} data-testid={`admin-pickup-deliver-inline-${o.id}`}
-                          title="Marcar Pickup como Entregado"
-                          className="flex items-center gap-1 h-8 px-3 rounded-full bg-[#3F634A] hover:bg-[#2E4A37] text-white text-[11px] font-bold uppercase tracking-wider shadow-sm">
-                          <PackageCheck className="h-3.5 w-3.5" />Entregado
+                      {['pendiente', 'sin_pagar', 'en_camino'].includes(o.status) && (
+                        <button type="button" onClick={() => togglePrepared(o.id, !o.prepared)} data-testid={`prepared-toggle-${o.id}`}
+                          title={o.prepared ? `Preparado por ${o.prepared_by_name || '-'}` : 'Marcar como preparado/listo'}
+                          className={`flex items-center justify-center h-8 w-8 rounded-full transition-all shrink-0
+                            ${o.prepared ? 'bg-[#3F634A] text-white shadow-sm' : 'bg-white border border-[#501122]/15 text-[#78686C] hover:border-[#3F634A]/40 hover:text-[#3F634A]'}`}>
+                          <Check className="h-4 w-4" strokeWidth={3.5} />
                         </button>
                       )}
                       <Popover>
@@ -1774,15 +2359,28 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                               <span>Editar pedido</span>
                             </button>
                           )}
-                          {o.delivery_id && o.status === 'pendiente' && (
+                          {o.delivery_id && ['pendiente', 'en_camino'].includes(o.status) && (
+                            <PopoverClose asChild>
+                              <button
+                                type="button"
+                                onClick={() => unassignDelivery(o.id)}
+                                data-testid={`unassign-order-${o.id}`}
+                                className="w-full text-left px-3 py-2 text-xs font-semibold text-[#C27A29] hover:bg-[#C27A29]/10 rounded-xl flex items-center gap-2 transition-colors"
+                              >
+                                <Undo2 className="h-3.5 w-3.5 text-[#C27A29]" />
+                                <span>Devolver a Disponibles</span>
+                              </button>
+                            </PopoverClose>
+                          )}
+                          {o.status === 'entregado' && (
                             <button
                               type="button"
-                              onClick={() => unassignDelivery(o.id)}
-                              data-testid={`unassign-order-${o.id}`}
-                              className="w-full text-left px-3 py-2 text-xs font-semibold text-[#C27A29] hover:bg-[#C27A29]/10 rounded-xl flex items-center gap-2 transition-colors"
+                              onClick={() => updateStatus(o.id, o.delivery_id ? 'en_camino' : 'pendiente')}
+                              data-testid={`revert-order-${o.id}`}
+                              className="w-full text-left px-3 py-2 text-xs font-semibold text-amber-700 hover:bg-amber-50 rounded-xl flex items-center gap-2 transition-colors"
                             >
-                              <Undo2 className="h-3.5 w-3.5 text-[#C27A29]" />
-                              <span>Devolver a Disponibles</span>
+                              <Undo2 className="h-3.5 w-3.5 text-amber-600" />
+                              <span>Revertir entregado</span>
                             </button>
                           )}
                           {o.status !== 'cancelado' && o.status !== 'entregado' && (
@@ -1841,7 +2439,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                 orders={(Array.isArray(orders) ? orders : []).filter(o => ['pendiente', 'en_camino'].includes(o.status) && o.order_type !== 'pickup')}
                 title="Mapa"
                 testId="admin-pedidos-map"
-                centralPoint={settings.central_point_lat && settings.central_point_lng ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : null}
+                centralPoint={(settings.central_point_lat && settings.central_point_lng) ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : getStoredCentralPoint()}
                 minimal={true}
                 deliveryLocations={deliveryLocations}
               />
@@ -1853,7 +2451,7 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
       {/* CLIENTES */}
       {activeSection === 'clientes' && (
         <div className="space-y-5">
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             {[
               { label: 'Total Clientes', value: clientStats?.total_customers || 0, icon: Users, color: 'bg-[#501122]' },
               { label: 'Recurrentes', value: clientStats?.repeat_customers || 0, sub: clientStats?.total_customers ? `${((clientStats.repeat_customers / clientStats.total_customers) * 100).toFixed(0)}%` : '0%', icon: UserCheck, color: 'bg-[#3F634A]' },
@@ -1872,25 +2470,99 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
             </Button>
             {loadingClientStats && <Loader2 className="h-4 w-4 animate-spin text-[#78686C]" />}
           </div>
-          <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 shadow-[0_8px_30px_rgba(80,17,34,0.03)] overflow-hidden">
-            {filteredClients.length === 0 ? <p className="text-center py-16 text-[#78686C]">Sin clientes</p> : (
-              <div className="divide-y divide-[#501122]/5">
-                {filteredClients.map(c => (
-                  <div key={c.id} className="p-5 flex items-center gap-4 cursor-pointer hover:bg-[#501122]/[0.02] transition-colors" onClick={() => openClientHistory(c)} data-testid={`client-row-${c.id}`}>
-                    <div className="flex-1 min-w-0"><p className="font-heading text-[#501122] text-sm">{c.name}</p><p className="text-xs text-[#78686C] flex items-center gap-1.5 mt-0.5"><Phone className="h-3 w-3" />{c.phone}</p></div>
-                    <Badge onClick={(e) => { e.stopPropagation(); openClientHistory(c); }} className="bg-[#F3EBE0] text-[#501122] hover:bg-[#501122] hover:text-white transition-colors cursor-pointer rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-wider border-0" data-testid={`client-delivered-badge-${c.id}`}>{c.order_count || 0} entregados</Badge>
-                    <button onClick={(e) => { e.stopPropagation(); openEditCustomer(c); }} className="w-9 h-9 rounded-full bg-[#F3EBE0] flex items-center justify-center text-[#501122] hover:bg-[#501122] hover:text-white transition-all active:scale-90 shrink-0" data-testid={`client-edit-${c.id}`}><Pencil className="h-3.5 w-3.5" /></button>
-                    {isAdmin && <button onClick={(e) => { e.stopPropagation(); deleteClient(c.id); }} className="w-9 h-9 rounded-full bg-red-50 flex items-center justify-center text-red-500 hover:bg-red-500 hover:text-white transition-all active:scale-90 shrink-0" data-testid={`client-delete-${c.id}`}><Trash2 className="h-3.5 w-3.5" /></button>}
-                    <a href={`https://wa.me/${(c.phone || '').replace(/[^0-9]/g, '')}`} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="w-9 h-9 rounded-full bg-[#25D366] flex items-center justify-center hover:bg-[#1da851] transition-all active:scale-90 shrink-0" data-testid={`client-wa-${c.id}`}><MessageCircle className="h-4 w-4 text-white" /></a>
+
+          {filteredClients.length === 0 ? (
+            <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-12 text-center text-[#78686C]">
+              Sin clientes
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5 gap-3.5">
+              {filteredClients.map(c => {
+                const initial = (c.name || '?').trim().charAt(0).toUpperCase();
+                return (
+                  <div
+                    key={c.id}
+                    onClick={() => openClientHistory(c)}
+                    data-testid={`client-row-${c.id}`}
+                    className="bg-white rounded-[1.25rem] border border-[#501122]/10 p-4 shadow-[0_4px_15px_rgba(80,17,34,0.02)] hover:shadow-md hover:border-[#501122]/25 transition-all duration-200 cursor-pointer flex flex-col justify-between gap-3 group"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="w-9 h-9 rounded-full bg-[#501122]/10 text-[#501122] flex items-center justify-center font-extrabold text-sm shrink-0">
+                          {initial}
+                        </div>
+                        <div className="min-w-0">
+                          <p className="font-heading font-bold text-[#501122] text-sm truncate group-hover:text-[#3D0C19] flex items-center gap-1" title={c.name}>
+                            <span>{c.name}</span>
+                            {c.gender === 'M' && <span className="text-blue-500 font-bold shrink-0" title="Hombre">&#9794;</span>}
+                            {c.gender === 'F' && <span className="text-pink-500 font-bold shrink-0" title="Mujer">&#9792;</span>}
+                          </p>
+                          <p className="text-[11px] text-[#78686C] flex items-center gap-1 mt-0.5 truncate">
+                            <Phone className="h-3 w-3 shrink-0" />
+                            <span className="truncate">{c.phone || 'Sin telf'}</span>
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-2 border-t border-[#501122]/5">
+                      <Badge
+                        onClick={(e) => { e.stopPropagation(); openClientHistory(c); }}
+                        className="bg-[#F3EBE0] text-[#501122] hover:bg-[#501122] hover:text-white transition-colors cursor-pointer rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider border-0"
+                        data-testid={`client-delivered-badge-${c.id}`}
+                      >
+                        {c.order_count || 0} entregados
+                      </Badge>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); openEditCustomer(c); }}
+                          className="w-7 h-7 rounded-full bg-[#F3EBE0] flex items-center justify-center text-[#501122] hover:bg-[#501122] hover:text-white transition-all active:scale-90"
+                          data-testid={`client-edit-${c.id}`}
+                          title="Editar cliente"
+                        >
+                          <Pencil className="h-3 w-3" />
+                        </button>
+                        {isAdmin && (
+                          <button
+                            type="button"
+                            onClick={(e) => { e.stopPropagation(); deleteClient(c.id); }}
+                            className="w-7 h-7 rounded-full bg-red-50 flex items-center justify-center text-red-500 hover:bg-red-500 hover:text-white transition-all active:scale-90"
+                            data-testid={`client-delete-${c.id}`}
+                            title="Eliminar cliente"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        )}
+                        <a
+                          href={`https://wa.me/${(c.phone || '').replace(/[^0-9]/g, '')}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={e => e.stopPropagation()}
+                          className="w-7 h-7 rounded-full bg-[#25D366] flex items-center justify-center hover:bg-[#1da851] transition-all active:scale-90"
+                          data-testid={`client-wa-${c.id}`}
+                          title="Contactar por WhatsApp"
+                        >
+                          <MessageCircle className="h-3.5 w-3.5 text-white" />
+                        </a>
+                      </div>
+                    </div>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
+                );
+              })}
+            </div>
+          )}
           {/* Client History Dialog */}
           <Dialog open={showClientDialog} onOpenChange={setShowClientDialog}>
             <DialogContent className="bg-white border-[#501122]/10 max-h-[85vh] overflow-y-auto rounded-[1.5rem]">
-              <DialogHeader><DialogTitle className="text-[#501122] font-heading">{selectedClient?.name}</DialogTitle></DialogHeader>
+              <DialogHeader>
+                <DialogTitle className="text-[#501122] font-heading flex items-center gap-1.5">
+                  <span>{selectedClient?.name}</span>
+                  {selectedClient?.gender === 'M' && <span className="text-blue-500 font-bold" title="Hombre">&#9794;</span>}
+                  {selectedClient?.gender === 'F' && <span className="text-pink-500 font-bold" title="Mujer">&#9792;</span>}
+                </DialogTitle>
+              </DialogHeader>
               {selectedClient && (
                 <div className="space-y-4">
                   <div className="flex items-center gap-3 text-sm text-[#78686C]">
@@ -1940,13 +2612,12 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                 <div className="space-y-2">
                   <Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]">WhatsApp</Label>
                   <div className="flex gap-2">
-                    <Select value={customerForm.prefix} onValueChange={(v) => setCustomerForm({ ...customerForm, prefix: v })}>
-                      <SelectTrigger className="w-24 bg-[#F3EBE0] border-[#501122]/10 text-[#1F1517] h-12 rounded-2xl" data-testid="admin-customer-prefix"><SelectValue /></SelectTrigger>
-                      <SelectContent className="rounded-2xl border-[#501122]/10">
-                        <SelectItem value="+58">+58</SelectItem><SelectItem value="+1">+1</SelectItem>
-                        <SelectItem value="+57">+57</SelectItem><SelectItem value="+34">+34</SelectItem>
-                      </SelectContent>
-                    </Select>
+                    <Input 
+                      value={customerForm.prefix} 
+                      onChange={(e) => setCustomerForm({ ...customerForm, prefix: '+' + e.target.value.replace(/\D/g, '') })}
+                      className="w-20 bg-[#F3EBE0] border-[#501122]/10 text-[#1F1517] h-12 rounded-2xl px-2 text-center font-medium" 
+                      data-testid="admin-customer-prefix" 
+                    />
                     <Input value={customerForm.phone} onChange={(e) => setCustomerForm({ ...customerForm, phone: e.target.value.replace(/\D/g, '') })}
                       placeholder="4124567890" className="bg-[#F3EBE0] border-[#501122]/10 text-[#1F1517] h-12 rounded-2xl px-4 flex-1" data-testid="admin-customer-phone-input" />
                   </div>
@@ -2070,21 +2741,11 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
       {/* MAPA */}
       {activeSection === 'config' && configSubSection === 'mapa' && (
         <div className="space-y-5">
-          <div className="flex gap-1 bg-[#F0E4D8] rounded-full p-1 w-fit">
-            <button onClick={() => setMapTab('zones')} data-testid="map-tab-zones"
-              className={`flex items-center gap-2 px-5 py-2 rounded-full text-xs font-semibold transition-all duration-300 ${mapTab === 'zones' ? 'bg-white text-[#501122] shadow-sm' : 'text-[#78686C] hover:text-[#501122]'}`}>
-              <MapPin className="h-3.5 w-3.5" />Zonas de Delivery
-            </button>
-            <button onClick={() => setMapTab('heatmap')} data-testid="map-tab-heatmap"
-              className={`flex items-center gap-2 px-5 py-2 rounded-full text-xs font-semibold transition-all duration-300 ${mapTab === 'heatmap' ? 'bg-white text-[#501122] shadow-sm' : 'text-[#78686C] hover:text-[#501122]'}`}>
-              <Flame className="h-3.5 w-3.5" />Mapa de Calor
-            </button>
-          </div>
           <ErrorBoundary
             title="Error cargando el mapa"
-            message="Esta seccion necesita Google Maps con la libreria Drawing/Visualization habilitada. Verifica que la API key en Google Cloud Console permita el dominio actual y tenga las librerias habilitadas."
+            message="Esta seccion necesita Google Maps con la libreria Visualization habilitada. Verifica que la API key en Google Cloud Console permita el dominio actual."
           >
-            {mapTab === 'zones' ? <ZonesManager /> : <SalesHeatmap />}
+            <SalesHeatmap />
           </ErrorBoundary>
         </div>
       )}
@@ -2110,7 +2771,13 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                       data-testid={`user-photo-input-${u.id}`}
                     />
                   </label>
-                  <div className="flex-1 min-w-0"><p className="font-heading text-[#501122] text-sm">{u.name}</p><p className="text-xs text-[#78686C]">@{u.username}</p></div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="font-heading text-[#501122] text-sm font-semibold">{u.name}</p>
+                      <span className="w-3 h-3 rounded-full border border-black/15 shrink-0 shadow-sm" style={{ backgroundColor: u.color || '#501122' }} title={`Color asignado: ${u.color || '#501122'}`} />
+                    </div>
+                    <p className="text-xs text-[#78686C]">@{u.username}</p>
+                  </div>
                   <Badge className="bg-[#F3EBE0] text-[#501122] rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-wider border-0">{roleLabels[u.role]}</Badge>
                   <div className="flex gap-1">
                     {u.photo_data_url && (
@@ -2130,6 +2797,35 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                 <div className="space-y-2"><Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]">Usuario</Label><Input value={userForm.username} onChange={(e) => setUserForm({ ...userForm, username: e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, '') })} placeholder="usuario" autoComplete="off" className="bg-[#F3EBE0] border-[#501122]/10 text-[#1F1517] h-12 rounded-2xl px-4" data-testid="user-username-input" /></div>
                 <div className="space-y-2"><Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]">{editingUser ? 'Nueva Contrasena (vacio = no cambiar)' : 'Contrasena'}</Label><Input type="password" value={userForm.password} onChange={(e) => setUserForm({ ...userForm, password: e.target.value })} autoComplete="new-password" className="bg-[#F3EBE0] border-[#501122]/10 text-[#1F1517] h-12 rounded-2xl px-4" data-testid="user-password-input" /></div>
                 <div className="space-y-2"><Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]">Rol</Label><Select value={userForm.role} onValueChange={(v) => setUserForm({ ...userForm, role: v })}><SelectTrigger className="bg-[#F3EBE0] border-[#501122]/10 text-[#1F1517] h-12 rounded-2xl" data-testid="user-role-select"><SelectValue /></SelectTrigger><SelectContent className="rounded-2xl border-[#501122]/10"><SelectItem value="admin">Administrador</SelectItem><SelectItem value="vendedor">Vendedor</SelectItem><SelectItem value="delivery">Repartidor</SelectItem></SelectContent></Select></div>
+                
+                <div className="space-y-2">
+                  <Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]">Color del Miembro (Para Mapa y Perfil)</Label>
+                  <div className="flex flex-wrap gap-2 items-center">
+                    {['#501122', '#ef4444', '#f97316', '#f59e0b', '#10b981', '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899'].map((col) => (
+                      <button
+                        key={col}
+                        type="button"
+                        onClick={() => setUserForm({ ...userForm, color: col })}
+                        className="w-8 h-8 rounded-full border-2 transition-transform active:scale-95 shrink-0"
+                        style={{
+                          backgroundColor: col,
+                          borderColor: userForm.color === col ? '#1F1517' : 'transparent',
+                          boxShadow: userForm.color === col ? '0 0 0 1px rgba(0,0,0,0.1)' : 'none',
+                        }}
+                        title={col}
+                      />
+                    ))}
+                    <div className="relative w-8 h-8 rounded-full border border-[#501122]/20 overflow-hidden shrink-0 shadow-inner" title="Color personalizado">
+                      <input
+                        type="color"
+                        value={userForm.color || '#501122'}
+                        onChange={(e) => setUserForm({ ...userForm, color: e.target.value })}
+                        className="absolute inset-[-4px] w-[40px] h-[40px] cursor-pointer border-0 p-0"
+                      />
+                    </div>
+                  </div>
+                </div>
+
                 <Button onClick={saveUser} className="w-full bg-[#501122] hover:bg-[#3D0C19] text-white h-12 rounded-full font-semibold shadow-md" data-testid="save-user-btn">{editingUser ? 'Actualizar' : 'Crear Usuario'}</Button>
               </div>
             </DialogContent>
@@ -2233,6 +2929,80 @@ export default function AdminDashboard({ role = 'admin' } = {}) {
                 ))}
               </div>
             </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Import New Customers Classification Dialog */}
+      <Dialog open={showImportCustomersDialog} onOpenChange={setShowImportCustomersDialog}>
+        <DialogContent className="bg-white border-[#501122]/10 rounded-[1.5rem] max-w-lg max-h-[85vh] flex flex-col p-6" data-testid="import-customers-dialog">
+          <DialogHeader className="shrink-0 pb-3 border-b border-[#501122]/5">
+            <DialogTitle className="text-[#501122] font-heading text-lg">Nuevos Clientes Agregados</DialogTitle>
+            <p className="text-xs text-[#78686C] mt-1">Por favor, clasifica si los siguientes clientes importados son Hombre o Mujer de forma manual antes de guardar.</p>
+          </DialogHeader>
+
+          <div className="flex-1 overflow-y-auto space-y-4 py-4 pr-1">
+            {importedNewCustomers.map((cust) => (
+              <div key={cust.id} className="p-4 bg-[#F3EBE0]/45 border border-[#501122]/5 rounded-2xl flex items-center justify-between gap-4" data-testid={`import-cust-row-${cust.id}`}>
+                <div className="min-w-0">
+                  <p className="font-semibold text-sm text-[#1F1517] truncate">{cust.name}</p>
+                  <p className="text-xs text-[#78686C] mt-0.5">{cust.phone || 'Sin número'}</p>
+                </div>
+                
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => handleImportGenderSelect(cust.id, 'M')}
+                    className={`h-9 px-3.5 rounded-full text-xs font-semibold border transition-all duration-200 ${
+                      cust.gender === 'M'
+                        ? 'bg-blue-500 text-white border-blue-500 shadow-sm'
+                        : 'bg-blue-50/50 text-blue-600 border-blue-100 hover:border-blue-200'
+                    }`}
+                    data-testid={`import-cust-m-${cust.id}`}
+                  >
+                    Hombre
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleImportGenderSelect(cust.id, 'F')}
+                    className={`h-9 px-3.5 rounded-full text-xs font-semibold border transition-all duration-200 ${
+                      cust.gender === 'F'
+                        ? 'bg-pink-500 text-white border-pink-500 shadow-sm'
+                        : 'bg-pink-50/50 text-pink-600 border-pink-100 hover:border-pink-200'
+                    }`}
+                    data-testid={`import-cust-f-${cust.id}`}
+                  >
+                    Mujer
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="shrink-0 pt-3 border-t border-[#501122]/5 flex justify-end gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setShowImportCustomersDialog(false)}
+              className="border-[#501122]/15 text-[#501122] rounded-full h-11 px-6 font-semibold"
+              disabled={savingImportGenders}
+            >
+              Cancelar
+            </Button>
+            <Button
+              onClick={saveImportGenders}
+              disabled={savingImportGenders}
+              className="bg-[#3F634A] hover:bg-[#2D4D35] text-white rounded-full h-11 px-6 font-semibold shadow-md flex items-center justify-center gap-1.5"
+              data-testid="save-import-genders-btn"
+            >
+              {savingImportGenders ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Guardando...
+                </>
+              ) : (
+                'Guardar clientes'
+              )}
+            </Button>
           </div>
         </DialogContent>
       </Dialog>

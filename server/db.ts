@@ -340,9 +340,17 @@ const memoryStore: {
     {
       key: 'app_settings',
       exchange_rate_ves: 36.5,
+      delivery_driver_pct: 85.0,
       central_point_url: null,
       central_point_lat: null,
       central_point_lng: null,
+      logo_url: '/logo.svg',
+      favicon_url: '/isotipo.webp',
+      font_family: 'Playfair Display',
+      primary_color: '#501122',
+      secondary_color: '#FBF7F0',
+      app_title: "Lubo's Tiramisú",
+      app_subtitle: 'Gestión y Logística',
       updated_at: new Date(),
     },
   ],
@@ -592,6 +600,7 @@ export interface User {
   name: string;
   role: 'admin' | 'vendedor' | 'delivery' | string;
   photo_data_url?: string | null;
+  color?: string | null;
   location?: {
     lat: number;
     lng: number;
@@ -720,6 +729,7 @@ export function formatUser(u: any): User {
     name: u.name,
     role: u.role,
     photo_data_url: u.photo_data_url,
+    color: u.color,
     location: u.location_lat != null && u.location_lng != null
       ? {
           lat: u.location_lat,

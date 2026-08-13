@@ -4,9 +4,11 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
-import { Pencil, MapPin, CalendarClock, DollarSign, FileText, Hourglass, Truck, ShoppingBag, Sparkles, Loader2, CheckCircle2 } from 'lucide-react';
+import { Pencil, MapPin, CalendarClock, DollarSign, FileText, Hourglass, Truck, ShoppingBag, Store, Sparkles, Loader2, CheckCircle2 } from 'lucide-react';
 import api from '@/lib/api';
 import { toast } from 'sonner';
+import { AddressMiniMap } from '@/components/OrderForm';
+import { getStoredCentralPoint, syncCentralPointWithBackend } from '@/lib/centralPoint';
 
 export default function EditOrderDialog({ order, open, onOpenChange, onSaved }) {
   const [form, setForm] = useState({
@@ -18,9 +20,23 @@ export default function EditOrderDialog({ order, open, onOpenChange, onSaved }) 
     wait_for_notice: false,
   });
   const [detectedCoords, setDetectedCoords] = useState(null);
+  const [manualCoords, setManualCoords] = useState(null);
+  const [centralPoint, setCentralPoint] = useState(() => getStoredCentralPoint());
   const [calculating, setCalculating] = useState(false);
   const [calcSuccess, setCalcSuccess] = useState(false);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.get('/settings').then(s => {
+      syncCentralPointWithBackend(s.data);
+      const cp = getStoredCentralPoint();
+      if (cp) setCentralPoint(cp);
+    }).catch(() => {});
+
+    const onSetSync = () => setCentralPoint(getStoredCentralPoint());
+    window.addEventListener('lubos:settings-changed', onSetSync);
+    return () => window.removeEventListener('lubos:settings-changed', onSetSync);
+  }, []);
 
   useEffect(() => {
     if (!order) return;
@@ -28,8 +44,10 @@ export default function EditOrderDialog({ order, open, onOpenChange, onSaved }) 
     if (order.scheduled_for) {
       try {
         const d = new Date(order.scheduled_for);
-        const pad = (n) => String(n).padStart(2, '0');
-        sched = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        if (!isNaN(d.getTime())) {
+          const pad = (n) => String(n).padStart(2, '0');
+          sched = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
       } catch { sched = ''; }
     }
     const oType = order.order_type || 'delivery';
@@ -41,6 +59,7 @@ export default function EditOrderDialog({ order, open, onOpenChange, onSaved }) 
       notes: order.notes || '',
       wait_for_notice: !!order.wait_for_notice,
     });
+    setManualCoords(null);
     if (typeof order.lat === 'number' && typeof order.lng === 'number') {
       setDetectedCoords({ lat: order.lat, lng: order.lng });
     } else {
@@ -76,12 +95,35 @@ export default function EditOrderDialog({ order, open, onOpenChange, onSaved }) 
     }
   };
 
+  const calculateCostFromCoords = async (coords) => {
+    if (!coords) return;
+    setCalculating(true);
+    try {
+      const res = await api.post('/zones/check', { lat: coords.lat, lng: coords.lng, mode: 'route' });
+      if (res.data) {
+        if (typeof res.data.lat === 'number' && typeof res.data.lng === 'number') {
+          setDetectedCoords({ lat: res.data.lat, lng: res.data.lng });
+        }
+        const cost = res.data.delivery_cost_usd ?? res.data.linear_cost_usd;
+        if (cost != null) {
+          setForm(prev => ({ ...prev, delivery_fee: String(cost) }));
+          setCalcSuccess(true);
+          toast.success(`Costo recalculado por posición: $${cost}`);
+        }
+      }
+    } catch (err) {
+      console.warn('Error recalculating from coords:', err);
+    } finally {
+      setCalculating(false);
+    }
+  };
+
   const handleOrderTypeChange = (newType) => {
     if (newType === form.order_type) return;
-    if (newType === 'pickup') {
+    if (newType === 'pickup' || newType === 'tienda') {
       setForm(prev => ({
         ...prev,
-        order_type: 'pickup',
+        order_type: newType,
         delivery_fee: '0',
       }));
       setDetectedCoords(null);
@@ -101,16 +143,16 @@ export default function EditOrderDialog({ order, open, onOpenChange, onSaved }) 
     if (!order) return;
     setBusy(true);
     try {
-      const isPickup = form.order_type === 'pickup';
+      const isDelivery = form.order_type === 'delivery';
       const payload = {
         order_type: form.order_type,
-        delivery_address: isPickup ? '' : (form.delivery_address || ''),
-        delivery_fee: isPickup ? 0 : parseFloat(form.delivery_fee || 0),
-        scheduled_for: form.scheduled_for ? new Date(form.scheduled_for).toISOString() : null,
+        delivery_address: isDelivery ? (form.delivery_address || '') : '',
+        delivery_fee: isDelivery ? parseFloat(form.delivery_fee || 0) : 0,
+        scheduled_for: form.scheduled_for && !isNaN(new Date(form.scheduled_for).getTime()) ? new Date(form.scheduled_for).toISOString() : null,
         notes: form.notes || '',
         wait_for_notice: form.wait_for_notice,
       };
-      if (!isPickup && detectedCoords) {
+      if (isDelivery && detectedCoords) {
         payload.lat = detectedCoords.lat;
         payload.lng = detectedCoords.lng;
       }
@@ -141,32 +183,45 @@ export default function EditOrderDialog({ order, open, onOpenChange, onSaved }) 
             <Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]">
               Tipo de entrega
             </Label>
-            <div className="grid grid-cols-2 gap-2 bg-[#F3EBE0]/60 p-1 rounded-2xl border border-[#501122]/10">
+            <div className="grid grid-cols-3 gap-2 bg-[#F3EBE0]/60 p-1 rounded-2xl border border-[#501122]/10">
               <button
                 type="button"
                 onClick={() => handleOrderTypeChange('delivery')}
                 data-testid="edit-order-type-delivery"
-                className={`h-10 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 ${
+                className={`h-10 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
                   form.order_type === 'delivery'
                     ? 'bg-[#501122] text-white shadow-md'
                     : 'text-[#78686C] hover:text-[#501122]'
                 }`}
               >
-                <Truck className="h-4 w-4" />
+                <Truck className="h-3.5 w-3.5" />
                 <span>Delivery</span>
               </button>
               <button
                 type="button"
                 onClick={() => handleOrderTypeChange('pickup')}
                 data-testid="edit-order-type-pickup"
-                className={`h-10 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 ${
+                className={`h-10 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
                   form.order_type === 'pickup'
                     ? 'bg-[#C27A29] text-white shadow-md'
                     : 'text-[#78686C] hover:text-[#C27A29]'
                 }`}
               >
-                <ShoppingBag className="h-4 w-4" />
-                <span>Retiro en tienda (Pickup)</span>
+                <ShoppingBag className="h-3.5 w-3.5" />
+                <span>Pickup</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleOrderTypeChange('tienda')}
+                data-testid="edit-order-type-tienda"
+                className={`h-10 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+                  form.order_type === 'tienda'
+                    ? 'bg-emerald-700 text-white shadow-md'
+                    : 'text-[#78686C] hover:text-emerald-700'
+                }`}
+              >
+                <Store className="h-3.5 w-3.5" />
+                <span>Tienda</span>
               </button>
             </div>
           </div>
@@ -207,6 +262,24 @@ export default function EditOrderDialog({ order, open, onOpenChange, onSaved }) 
                 <div className="flex items-center gap-1.5 text-xs text-[#3F634A] font-semibold bg-[#3F634A]/10 px-3 py-1.5 rounded-xl">
                   <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
                   <span>Ubicación detectada y costo de delivery actualizado</span>
+                </div>
+              )}
+              {(form.delivery_address || detectedCoords || manualCoords) && (
+                <div className="mt-2">
+                  <AddressMiniMap
+                    addressUrl={form.delivery_address}
+                    detectedZone={detectedCoords ? { lat: detectedCoords.lat, lng: detectedCoords.lng, delivery_cost_usd: form.delivery_fee ? parseFloat(form.delivery_fee) : undefined } : null}
+                    centralPoint={centralPoint}
+                    manualCoords={manualCoords}
+                    onManualPinChange={(coords) => {
+                      setManualCoords(coords);
+                      if (coords) {
+                        setDetectedCoords(coords);
+                        calculateCostFromCoords(coords);
+                      }
+                    }}
+                    waitForNotice={form.wait_for_notice}
+                  />
                 </div>
               )}
             </div>

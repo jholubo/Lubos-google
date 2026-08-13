@@ -1,5 +1,5 @@
-import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { GoogleMap, Marker, OverlayView, Polyline } from '@react-google-maps/api';
+import { useState, useMemo, useCallback, useEffect, useRef, memo } from 'react';
+import { GoogleMap, Marker, OverlayViewF, Polyline } from '@react-google-maps/api';
 import { SafeMapsLoader, DEFAULT_CENTER, DEFAULT_ZOOM, MAP_STYLES } from '@/lib/mapsLoader';
 import { Loader2, Maximize2, MapPin, Home, Crosshair, Frame, Package } from 'lucide-react';
 
@@ -17,6 +17,35 @@ function deliveryColor(id) {
   return `hsl(${hue}, 78%, 44%)`;
 }
 
+// Order pin color helper: when status is "en_camino" and assigned to driver, use driver's distinct color
+function getOrderPinColor(o, deliveryLocations = []) {
+  if (o.wait_for_notice) return '#808080';
+
+  if (o.status === 'en_camino') {
+    if (o.delivery_id) {
+      const driver = (deliveryLocations || []).find(dl => String(dl.delivery_id) === String(o.delivery_id));
+      if (driver?.color) return driver.color;
+      return deliveryColor(o.delivery_id);
+    }
+    return STATUS_COLOR.en_camino;
+  }
+
+  return STATUS_COLOR[o.status] || '#501122';
+}
+
+// Distance calculation in meters between two lat/lng pairs
+function getDistanceMeters(lat1, lon1, lat2, lon2) {
+  if (lat1 === lat2 && lon1 === lon2) return 0;
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
 // Pin SVG path
 const buildPinIcon = (color, opacity = 1) => ({
   path: 'M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 0 1 0-5 2.5 2.5 0 0 1 0 5z',
@@ -28,12 +57,69 @@ const buildPinIcon = (color, opacity = 1) => ({
   anchor: { x: 12, y: 22 },
 });
 
-export function MapBody({ orders, height, centralPoint, centerRequestId = 0, defaultZoom = DEFAULT_ZOOM, hideCentralPin = false, draggablePinId = null, onPinDragEnd = null, showRoute = false, onRouteStatus = null, fitAllRequestId = 0, deliveryLocations = [] }) {
+// Memoized custom Overlay component for live delivery drivers to prevent flickering on position changes
+const LiveDriverOverlay = memo(({ d, position, pixelOffsetX, pixelOffsetY, color, isInactive }) => {
+  const posLat = position?.lat;
+  const posLng = position?.lng;
+  const stablePosition = useMemo(() => ({ lat: posLat, lng: posLng }), [posLat, posLng]);
+
+  const getOffset = useCallback((w, h) => ({
+    x: -(w / 2) + pixelOffsetX,
+    y: -(h / 2) + pixelOffsetY,
+  }), [pixelOffsetX, pixelOffsetY]);
+
+  return (
+    <OverlayViewF
+      position={stablePosition}
+      mapPaneName="overlayMouseTarget"
+      getPixelPositionOffset={getOffset}
+    >
+      <div
+        className={`pointer-events-none flex flex-col items-center transition-opacity duration-300 ${isInactive ? 'opacity-80' : ''}`}
+        data-testid={`delivery-live-${d.delivery_id}`}
+        title={`${d.name} - ${isInactive ? 'Sin señal' : 'En ruta'}`}
+      >
+        <div className="relative">
+          <div
+            className={`relative w-9 h-9 rounded-full overflow-hidden border-[3px] shadow-lg bg-white flex items-center justify-center transition-transform hover:scale-110 ${!isInactive ? 'animate-driver-pulse' : 'grayscale'}`}
+            style={{ borderColor: color, '--pulse-color': color }}
+          >
+            {d.photo_url ? (
+              <img src={d.photo_url} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+            ) : (
+              <span className="text-[11px] font-bold text-[#501122]">{(d.name || '?')[0]}</span>
+            )}
+          </div>
+        </div>
+        <span className="mt-0.5 px-1.5 py-0 rounded-full text-white text-[9px] font-bold uppercase tracking-wider shadow-md whitespace-nowrap" style={{ background: color }}>
+          {d.name || 'Delivery'}{isInactive ? ' (Sin señal)' : ''}
+        </span>
+      </div>
+    </OverlayViewF>
+  );
+});
+
+export function MapBody({ orders, height, centralPoint, centerRequestId = 0, defaultZoom = DEFAULT_ZOOM, hideCentralPin = false, draggablePinId = null, onPinDragEnd = null, showRoute = false, onRouteStatus = null, fitAllRequestId = 0, deliveryLocations = [], userPanned, setUserPanned }) {
+  const [localUserPanned, setLocalUserPanned] = useState(false);
+  const isPanned = userPanned !== undefined ? userPanned : localUserPanned;
+  const setPanned = setUserPanned !== undefined ? setUserPanned : setLocalUserPanned;
+
   const [mapInstance, setMapInstance] = useState(null);
   const [zoom, setZoom] = useState(defaultZoom);
   const [routePath, setRoutePath] = useState(null);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setNow(Date.now());
+    }, 15000);
+    return () => clearInterval(interval);
+  }, []);
 
   const hasCentral = centralPoint && typeof centralPoint.lat === 'number' && typeof centralPoint.lng === 'number';
+
+  const getCentralOffset = useCallback((w, h) => ({ x: -(w / 2), y: -(h / 2) }), []);
+  const getLabelOffset = useCallback((w, h) => ({ x: -(w / 2), y: -(h + 38) }), []);
 
   const onZoomChanged = useCallback(() => {
     if (mapInstance) {
@@ -86,77 +172,85 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
     return Array.from(map.values());
   }, [orderPoints, zoom]);
 
-  // Compute Google-driving route from central point to the (single) order pin.
-  // Falls back to a straight geodesic line if Directions API is unavailable
-  // (project may only have Distance Matrix enabled — the fallback still lets
-  // the user see the store<->pin span and drag the pin to correct it).
+  // Calculate route between central point and order pin when showRoute is enabled
   const routeDestLat = showRoute && orderPoints.length === 1 ? orderPoints[0].lat : null;
   const routeDestLng = showRoute && orderPoints.length === 1 ? orderPoints[0].lng : null;
   const cpLat = hasCentral ? centralPoint.lat : null;
   const cpLng = hasCentral ? centralPoint.lng : null;
-  const [routeIsFallback, setRouteIsFallback] = useState(false);
   const onRouteStatusRef = useRef(onRouteStatus);
   useEffect(() => { onRouteStatusRef.current = onRouteStatus; }, [onRouteStatus]);
+
   useEffect(() => {
     if (!mapInstance || !showRoute || routeDestLat == null || cpLat == null) {
       setRoutePath(null);
-      setRouteIsFallback(false);
       if (onRouteStatusRef.current) onRouteStatusRef.current(null);
       return;
     }
-    if (!window.google?.maps) return;
 
-    const applyBounds = (pathPoints) => {
+    const origin = { lat: cpLat, lng: cpLng };
+    const destination = { lat: routeDestLat, lng: routeDestLng };
+    const straightPath = [origin, destination];
+
+    let cancelled = false;
+
+    if (window.google?.maps?.DirectionsService) {
+      const directionsService = new window.google.maps.DirectionsService();
+      directionsService.route(
+        {
+          origin,
+          destination,
+          travelMode: window.google.maps.TravelMode.DRIVING,
+        },
+        (result, status) => {
+          if (cancelled) return;
+          if (status === window.google.maps.DirectionsStatus.OK && result?.routes?.[0]?.overview_path) {
+            const overviewPath = result.routes[0].overview_path.map(pt => ({ lat: pt.lat(), lng: pt.lng() }));
+            setRoutePath(overviewPath);
+            if (onRouteStatusRef.current) onRouteStatusRef.current('route');
+            try {
+              const bounds = new window.google.maps.LatLngBounds();
+              overviewPath.forEach(p => bounds.extend(p));
+              mapInstance.fitBounds(bounds, { top: 50, bottom: 50, left: 50, right: 50 });
+            } catch { /* ignore */ }
+          } else {
+            setRoutePath(straightPath);
+            if (onRouteStatusRef.current) onRouteStatusRef.current('fallback');
+            try {
+              const bounds = new window.google.maps.LatLngBounds();
+              straightPath.forEach(p => bounds.extend(p));
+              mapInstance.fitBounds(bounds, { top: 50, bottom: 50, left: 50, right: 50 });
+            } catch { /* ignore */ }
+          }
+        }
+      );
+    } else {
+      setRoutePath(straightPath);
+      if (onRouteStatusRef.current) onRouteStatusRef.current('fallback');
       try {
         const bounds = new window.google.maps.LatLngBounds();
-        pathPoints.forEach(p => bounds.extend(p));
-        mapInstance.fitBounds(bounds, 60);
+        straightPath.forEach(p => bounds.extend(p));
+        mapInstance.fitBounds(bounds, { top: 50, bottom: 50, left: 50, right: 50 });
       } catch { /* ignore */ }
-    };
-
-    const straightFallback = () => {
-      const path = [
-        { lat: cpLat, lng: cpLng },
-        { lat: routeDestLat, lng: routeDestLng },
-      ];
-      setRoutePath(path);
-      setRouteIsFallback(true);
-      if (onRouteStatusRef.current) onRouteStatusRef.current('fallback');
-      applyBounds(path);
-    };
-
-    if (!window.google.maps.DirectionsService) {
-      straightFallback();
-      return;
     }
-    const svc = new window.google.maps.DirectionsService();
-    let cancelled = false;
-    svc.route(
-      {
-        origin: { lat: cpLat, lng: cpLng },
-        destination: { lat: routeDestLat, lng: routeDestLng },
-        travelMode: window.google.maps.TravelMode.DRIVING,
-      },
-      (result, status) => {
-        if (cancelled) return;
-        if (status === 'OK' && result?.routes?.[0]?.overview_path) {
-          const path = result.routes[0].overview_path.map(p => ({ lat: p.lat(), lng: p.lng() }));
-          setRoutePath(path);
-          setRouteIsFallback(false);
-          if (onRouteStatusRef.current) onRouteStatusRef.current('route');
-          applyBounds([...path, { lat: cpLat, lng: cpLng }, { lat: routeDestLat, lng: routeDestLng }]);
-        } else {
-          straightFallback();
-        }
-      }
-    );
+
     return () => { cancelled = true; };
   }, [mapInstance, showRoute, routeDestLat, routeDestLng, cpLat, cpLng]);
 
   // "Encuadrar" (fit-all) — bumped by parent to reframe the map to include every
   // order pin plus the store and live delivery driver locations. No-op when called with 0 (initial mount).
+  const lastFitAllIdRef = useRef(fitAllRequestId);
   useEffect(() => {
-    if (!mapInstance || fitAllRequestId <= 0 || !window.google?.maps) return;
+    if (!mapInstance || !window.google?.maps) return;
+
+    const isManualClick = fitAllRequestId > 0 && fitAllRequestId !== lastFitAllIdRef.current;
+    if (isManualClick) {
+      setPanned(false);
+      lastFitAllIdRef.current = fitAllRequestId;
+    } else {
+      if (fitAllRequestId <= 0) return;
+      if (isPanned) return;
+    }
+
     const pts = [];
     if (hasCentral) pts.push({ lat: centralPoint.lat, lng: centralPoint.lng });
     orderPoints.forEach(o => pts.push({ lat: o.lat, lng: o.lng }));
@@ -176,7 +270,90 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
       pts.forEach(p => bounds.extend(p));
       mapInstance.fitBounds(bounds, 80);
     } catch { /* ignore */ }
-  }, [fitAllRequestId, mapInstance, hasCentral, centralPoint, orderPoints, deliveryLocations]);
+  }, [fitAllRequestId, isPanned, setPanned, mapInstance, hasCentral, centralPoint, orderPoints, deliveryLocations]);
+
+  // Filter active live delivery drivers (seen in last 5 minutes)
+  const activeDrivers = useMemo(() => {
+    return (deliveryLocations || []).filter(d => {
+      if (typeof d.lat !== 'number' || typeof d.lng !== 'number') return false;
+      if (d.updated_at) {
+        const updatedMs = new Date(d.updated_at).getTime();
+        const fiveMinutesAgo = now - 5 * 60 * 1000;
+        if (updatedMs < fiveMinutesAgo) return false;
+      }
+      return true;
+    });
+  }, [deliveryLocations, now]);
+
+  // Separate active drivers into: drivers at store vs drivers on the road
+  const { driversAtStore, roadDriverMarkers } = useMemo(() => {
+    if (!activeDrivers.length) return { driversAtStore: [], roadDriverMarkers: [] };
+
+    const storeLat = (hasCentral && centralPoint) ? centralPoint.lat : null;
+    const storeLng = (hasCentral && centralPoint) ? centralPoint.lng : null;
+
+    const storeDrivers = [];
+    const roadDrivers = [];
+
+    for (const d of activeDrivers) {
+      if (storeLat != null && storeLng != null) {
+        const distToStore = getDistanceMeters(d.lat, d.lng, storeLat, storeLng);
+        if (distToStore < 80) { // < 80 meters from store
+          storeDrivers.push(d);
+          continue;
+        }
+      }
+      roadDrivers.push(d);
+    }
+
+    // Group drivers on the road if they are very close (< 30m) to avoid exact overlap
+    const clusters = [];
+    for (const d of roadDrivers) {
+      let added = false;
+      for (const c of clusters) {
+        const ref = c[0];
+        if (getDistanceMeters(d.lat, d.lng, ref.lat, ref.lng) < 30) {
+          c.push(d);
+          added = true;
+          break;
+        }
+      }
+      if (!added) clusters.push([d]);
+    }
+
+    const markers = [];
+    for (const c of clusters) {
+      const count = c.length;
+      if (count === 1) {
+        const d = c[0];
+        markers.push({
+          driver: d,
+          position: { lat: d.lat, lng: d.lng },
+          pixelOffsetX: 0,
+          pixelOffsetY: 0,
+        });
+      } else {
+        const avgLat = c.reduce((sum, item) => sum + item.lat, 0) / count;
+        const avgLng = c.reduce((sum, item) => sum + item.lng, 0) / count;
+        const radius = Math.max(26, 16 + count * 4);
+
+        c.forEach((d, i) => {
+          const angle = (-Math.PI / 2) + (i * (2 * Math.PI / count));
+          const offsetX = Math.round(radius * Math.cos(angle));
+          const offsetY = Math.round(radius * Math.sin(angle));
+
+          markers.push({
+            driver: d,
+            position: { lat: avgLat, lng: avgLng },
+            pixelOffsetX: offsetX,
+            pixelOffsetY: offsetY,
+          });
+        });
+      }
+    }
+
+    return { driversAtStore: storeDrivers, roadDriverMarkers: markers };
+  }, [activeDrivers, hasCentral, centralPoint]);
 
   return (
     <GoogleMap
@@ -184,6 +361,7 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
       zoom={defaultZoom}
       onLoad={handleLoad}
       onZoomChanged={onZoomChanged}
+      onDragStart={() => setPanned(true)}
       options={{
         styles: MAP_STYLES,
         streetViewControl: false,
@@ -192,32 +370,62 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
       }}
     >
       {routePath && (
-        <Polyline
-          path={routePath}
-          options={routeIsFallback ? {
-            // Straight-line fallback (Directions API not available): dashed, muted
-            strokeOpacity: 0,
-            geodesic: true,
-            icons: [{
-              icon: { path: 'M 0,-1 0,1', strokeOpacity: 0.8, strokeColor: '#78686C', scale: 3 },
-              offset: '0',
-              repeat: '12px',
-            }],
-          } : {
-            strokeColor: '#501122',
-            strokeOpacity: 0.9,
-            strokeWeight: 5,
-            geodesic: true,
-          }}
-        />
+        <>
+          <Polyline
+            path={routePath}
+            options={{
+              strokeColor: '#2B0912',
+              strokeOpacity: 0.35,
+              strokeWeight: 6,
+              geodesic: true,
+              clickable: false,
+            }}
+          />
+          <Polyline
+            path={routePath}
+            options={{
+              strokeColor: '#501122',
+              strokeOpacity: 0.95,
+              strokeWeight: 4,
+              geodesic: true,
+              clickable: false,
+            }}
+          />
+        </>
       )}
       {hasCentral && !hideCentralPin && (
-        <OverlayView
+        <OverlayViewF
           position={{ lat: centralPoint.lat, lng: centralPoint.lng }}
-          mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
-          getPixelPositionOffset={(w, h) => ({ x: -(w / 2), y: -(h / 2) })}
+          mapPaneName="overlayMouseTarget"
+          getPixelPositionOffset={getCentralOffset}
         >
           <div className="flex flex-col items-center pointer-events-none" data-testid="map-central-point">
+            {/* Repartidores actualmente en la tienda: se ven como un grupo compacto de puntos con sus colores */}
+            {driversAtStore.length > 0 && (
+              <div
+                className="mb-1 pointer-events-auto flex items-center gap-1.5 bg-[#1F1517]/90 backdrop-blur-xs border border-white/20 px-2 py-0.5 rounded-full shadow-lg"
+                title={`Repartidores en tienda: ${driversAtStore.map(d => d.name || 'Delivery').join(', ')}`}
+              >
+                <div className="flex items-center -space-x-1">
+                  {driversAtStore.map((d) => {
+                    const isInactive = d.updated_at ? (now - new Date(d.updated_at).getTime() > 1 * 60 * 1000) : false;
+                    const color = isInactive ? '#9CA3AF' : (d.color || deliveryColor(d.delivery_id));
+                    return (
+                      <span
+                        key={`store-dot-${d.delivery_id}`}
+                        className={`block w-3.5 h-3.5 rounded-full border-2 border-white shadow-xs transition-transform hover:scale-125 ${isInactive ? 'opacity-70 grayscale' : ''}`}
+                        style={{ backgroundColor: color }}
+                        title={`${d.name || 'Delivery'} ${isInactive ? '(Sin señal)' : '(En tienda)'}`}
+                      />
+                    );
+                  })}
+                </div>
+                <span className="text-[9px] font-extrabold text-amber-300 uppercase tracking-wider whitespace-nowrap">
+                  {driversAtStore.length} en tienda
+                </span>
+              </div>
+            )}
+
             <div className="relative">
               <div className="absolute inset-0 rounded-full bg-[#501122]/25 animate-ping"></div>
               <div className="relative w-8 h-8 rounded-full bg-gradient-to-br from-[#7A1A33] to-[#501122] border-2 border-white shadow-[0_3px_10px_rgba(80,17,34,0.4)] flex items-center justify-center">
@@ -228,12 +436,12 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
               Tienda
             </span>
           </div>
-        </OverlayView>
+        </OverlayViewF>
       )}
 
       {orderPoints.map(o => {
         const isWaitNotice = !!o.wait_for_notice;
-        const color = isWaitNotice ? '#808080' : (STATUS_COLOR[o.status] || '#501122');
+        const color = getOrderPinColor(o, deliveryLocations);
         const opacity = isWaitNotice ? 0.6 : 1;
         const icon = window.google ? buildPinIcon(color, opacity) : null;
         const isDraggable = draggablePinId && o.id === draggablePinId;
@@ -252,16 +460,16 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
       })}
 
       {labelGroups.map((g, gi) => (
-        <OverlayView
+        <OverlayViewF
           key={`g-${gi}`}
           position={{ lat: g.lat, lng: g.lng }}
-          mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
-          getPixelPositionOffset={(w, h) => ({ x: -(w / 2), y: -(h + 38) })}
+          mapPaneName="overlayMouseTarget"
+          getPixelPositionOffset={getLabelOffset}
         >
           <div className="flex flex-col gap-0.5 items-center pointer-events-none">
             {g.items.map(o => {
               const isWaitNotice = !!o.wait_for_notice;
-              const color = isWaitNotice ? '#6B7280' : (STATUS_COLOR[o.status] || '#501122');
+              const color = getOrderPinColor(o, deliveryLocations);
               return (
                 <div
                   key={o.id}
@@ -279,67 +487,23 @@ export function MapBody({ orders, height, centralPoint, centerRequestId = 0, def
               );
             })}
           </div>
-        </OverlayView>
+        </OverlayViewF>
       ))}
 
-      {/* Rutas dinamicas por delivery: se dibujan cuando el pedido tiene
-          route_polyline (guardado una sola vez cuando el delivery marca "en_camino").
-          Se muestran solo mientras el pedido no este entregado. Color por delivery. */}
-      {window.google?.maps?.geometry && (orders || [])
-        .filter(o => o.status === 'en_camino' && o.route_polyline && o.delivery_id)
-        .map(o => {
-          let path = null;
-          try { path = window.google.maps.geometry.encoding.decodePath(o.route_polyline).map(p => ({ lat: p.lat(), lng: p.lng() })); }
-          catch { return null; }
-          if (!path || path.length < 2) return null;
-          return (
-            <Polyline
-              key={`route-${o.id}`}
-              path={path}
-              options={{
-                strokeColor: deliveryColor(o.delivery_id),
-                strokeOpacity: 0.9,
-                strokeWeight: 5,
-                geodesic: true,
-                clickable: false,
-              }}
-            />
-          );
-        })}
-
-      {/* Ubicacion en vivo del delivery: pin con foto/inicial y ring de su color. */}
-      {(deliveryLocations || []).filter(d => typeof d.lat === 'number' && typeof d.lng === 'number').map(d => {
-        const color = deliveryColor(d.delivery_id);
+      {/* Ubicacion en vivo de los repartidores en ruta */}
+      {roadDriverMarkers.map(({ driver: d, position, pixelOffsetX, pixelOffsetY }) => {
+        const isInactive = d.updated_at ? (now - new Date(d.updated_at).getTime() > 1 * 60 * 1000) : false;
+        const color = isInactive ? '#9CA3AF' : (d.color || deliveryColor(d.delivery_id));
         return (
-          <OverlayView
+          <LiveDriverOverlay
             key={`dloc-${d.delivery_id}`}
-            position={{ lat: d.lat, lng: d.lng }}
-            mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
-            getPixelPositionOffset={(w, h) => ({ x: -(w / 2), y: -(h / 2) })}
-          >
-            <div
-              className="pointer-events-none flex flex-col items-center"
-              data-testid={`delivery-live-${d.delivery_id}`}
-              title={`${d.name} - ultima actualizacion`}
-            >
-              <div className="relative">
-                <span className="absolute inset-0 rounded-full animate-ping opacity-60" style={{ background: color }}></span>
-                <div
-                  className="relative w-9 h-9 rounded-full overflow-hidden border-[3px] shadow-lg bg-white flex items-center justify-center"
-                  style={{ borderColor: color }}
-                >
-                  {d.photo_url ? (
-                    <img src={d.photo_url} alt="" className="w-full h-full object-cover" />
-                  ) : (
-                    <span className="text-[11px] font-bold text-[#501122]">{(d.name || '?')[0]}</span>
-                  )}
-                </div>
-              </div>
-              <span className="mt-0.5 px-1.5 py-0 rounded-full text-white text-[9px] font-bold uppercase tracking-wider shadow-md whitespace-nowrap" style={{ background: color }}>
-                {d.name || 'Delivery'}
-              </span>
-            </div>
-          </OverlayView>
+            d={d}
+            position={position}
+            pixelOffsetX={pixelOffsetX}
+            pixelOffsetY={pixelOffsetY}
+            color={color}
+            isInactive={isInactive}
+          />
         );
       })}
     </GoogleMap>
@@ -363,6 +527,7 @@ export function isScheduledForFutureDay(scheduledForStr) {
 function DeliveryMapInner({ isLoaded, loadError, orders, title = 'Mapa de Entregas', subtitle, testId = 'delivery-map', hideFutureDays = true, centralPoint = null, expandHref = null, defaultHeight = 320, minimal = false, deliveryLocations = [], showRoute = false }) {
   const [centerRequestId, setCenterRequestId] = useState(0);
   const [fitAllRequestId, setFitAllRequestId] = useState(0);
+  const [userPanned, setUserPanned] = useState(false);
 
   // Filter out orders scheduled for a future day so they only appear starting on their scheduled date.
   const visibleOrders = useMemo(() => {
@@ -458,13 +623,16 @@ function DeliveryMapInner({ isLoaded, loadError, orders, title = 'Mapa de Entreg
             </div>
 
             <div className="w-full h-full">
-              <MapBody orders={visibleOrders} height="100%" centralPoint={centralPoint} centerRequestId={centerRequestId} fitAllRequestId={fitAllRequestId} deliveryLocations={deliveryLocations} showRoute={showRoute} />
+              <MapBody orders={visibleOrders} height="100%" centralPoint={centralPoint} centerRequestId={centerRequestId} fitAllRequestId={fitAllRequestId} deliveryLocations={deliveryLocations} showRoute={showRoute} userPanned={userPanned} setUserPanned={setUserPanned} />
             </div>
 
             {/* Bottom Center Floating Encuadrar Button */}
             <button
               type="button"
-              onClick={() => setFitAllRequestId(id => id + 1)}
+              onClick={() => {
+                setFitAllRequestId(id => id + 1);
+                setUserPanned(false);
+              }}
               data-testid={`${testId}-fit-all-btn`}
               title="Encuadrar la tienda, pedidos por entregar y repartidores"
               className="absolute left-1/2 -translate-x-1/2 bottom-5 z-10 flex items-center gap-2 px-5 h-10 rounded-full bg-[#501122] hover:bg-[#3D0C19] text-white text-xs font-bold uppercase tracking-wider shadow-lg active:scale-95 transition-all"

@@ -4,40 +4,71 @@ import { SafeMapsLoader } from '@/lib/mapsLoader';
 import { MapBody, isScheduledForFutureDay } from '@/components/DeliveryMap';
 import api from '@/lib/api';
 import { Loader2, MapPin, Crosshair } from 'lucide-react';
+import { getStoredCentralPoint, syncCentralPointWithBackend } from '@/lib/centralPoint';
 
 function MapViewInner({ isLoaded, loadError }) {
   const [params] = useSearchParams();
   const scope = params.get('scope') || 'admin-pending';
   const [orders, setOrders] = useState([]);
   const [settings, setSettings] = useState({});
+  const [deliveryLocations, setDeliveryLocations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [centerRequestId, setCenterRequestId] = useState(0);
 
   useEffect(() => {
     (async () => {
       try {
-        const [s, o] = await Promise.all([
+        const [s, o, dloc] = await Promise.all([
           api.get('/settings'),
           scope === 'delivery-available' ? api.get('/orders/available') : api.get('/orders'),
+          api.get('/delivery/locations').catch(() => ({ data: [] })),
         ]);
         setSettings(s.data || {});
+        syncCentralPointWithBackend(s.data);
         setOrders(Array.isArray(o.data) ? o.data : []);
+        setDeliveryLocations(Array.isArray(dloc.data) ? dloc.data : []);
       } catch (e) { console.warn(e); }
       finally { setLoading(false); }
     })();
+
+    const onLocationUpdate = (e) => {
+      const payload = e.detail;
+      if (!payload || typeof payload.lat !== 'number' || typeof payload.lng !== 'number') return;
+      const driverId = String(payload.driver_id || payload.delivery_id);
+      setDeliveryLocations(prevLocations => {
+        const list = Array.isArray(prevLocations) ? prevLocations : [];
+        const existing = list.find(d => String(d.delivery_id) === driverId);
+        const filtered = list.filter(d => String(d.delivery_id) !== driverId);
+        return [...filtered, {
+          delivery_id: driverId,
+          name: payload.name || 'Repartidor',
+          lat: payload.lat,
+          lng: payload.lng,
+          color: payload.color !== undefined ? payload.color : (existing ? existing.color : null),
+          photo_url: payload.photo_url !== undefined ? payload.photo_url : (existing ? existing.photo_url : null),
+          updated_at: payload.updated_at || new Date().toISOString(),
+        }];
+      });
+    };
+
+    window.addEventListener('lubos:location_update', onLocationUpdate);
+    return () => {
+      window.removeEventListener('lubos:location_update', onLocationUpdate);
+    };
   }, [scope]);
 
-  const centralPoint = useMemo(() => (
-    settings.central_point_lat && settings.central_point_lng
-      ? { lat: settings.central_point_lat, lng: settings.central_point_lng }
-      : null
-  ), [settings]);
+  const centralPoint = useMemo(() => {
+    if (settings.central_point_lat && settings.central_point_lng) {
+      return { lat: settings.central_point_lat, lng: settings.central_point_lng };
+    }
+    return getStoredCentralPoint();
+  }, [settings]);
 
   const safeOrders = useMemo(() => (Array.isArray(orders) ? orders : []), [orders]);
 
   const visibleOrders = useMemo(() => {
     return safeOrders.filter(o => {
-      if (!['pendiente', 'en_camino'].includes(o.status) || o.order_type === 'pickup') return false;
+      if (!['pendiente', 'en_camino'].includes(o.status) || o.order_type !== 'delivery') return false;
       if (isScheduledForFutureDay(o.scheduled_for)) return false;
       return true;
     });
@@ -84,7 +115,7 @@ function MapViewInner({ isLoaded, loadError }) {
           <p className="text-center py-16 text-[#78686C] text-sm">No hay pedidos con ubicacion para mostrar</p>
         )}
         {isLoaded && !loading && showMap && (
-          <MapBody orders={visibleOrders} height="100%" centralPoint={centralPoint} centerRequestId={centerRequestId} />
+          <MapBody orders={visibleOrders} height="100%" centralPoint={centralPoint} centerRequestId={centerRequestId} deliveryLocations={deliveryLocations} showRoute={true} />
         )}
       </div>
     </div>

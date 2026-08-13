@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { toast } from 'sonner';
 import api from '@/lib/api';
 
 const SOUND_URLS = {
@@ -244,11 +245,18 @@ export function useNotifications() {
       if (knownIdsRef.current !== null) {
         const newOnes = data.filter(n => !knownIdsRef.current.has(n.id) && !n.read);
         if (newOnes.length > 0) {
+          // Toast compacto en vivo para notificaciones entrantes
+          newOnes.forEach(n => {
+            if (n.message) {
+              toast(n.message);
+            }
+          });
+
           const types = new Set(newOnes.map(n => n.type));
           // Cualquier evento relacionado con pedidos → refrescar pedidos ya (evento global).
           const ORDER_TYPES = new Set([
-            'order_paid', 'order_delivered', 'new_sale',
-            'order_available_for_delivery', 'order_released',
+            'order_paid', 'order_delivered', 'order_reverted', 'new_sale',
+            'order_available_for_delivery', 'order_released', 'order_assigned',
           ]);
           if ([...types].some(t => ORDER_TYPES.has(t))) {
             try { window.dispatchEvent(new CustomEvent('lubos:orders-changed')); } catch { /* ignore */ }

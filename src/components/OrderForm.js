@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { toast } from 'sonner';
 import api, { formatUSD, formatVES } from '@/lib/api';
 import { getLocalCache, setLocalCache } from '@/lib/cache';
@@ -13,9 +13,10 @@ import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, Command
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { useBackButtonClose } from '@/hooks/useBackButtonClose';
 import { playNotificationSound } from '@/hooks/useNotifications';
-import { ShoppingBag, Phone, Minus, Plus, Check, ChevronsUpDown, ChevronDown, Truck, Link2, MapPin, FileText, CalendarClock, Copy, Cake, UserRoundPlus, Hourglass } from 'lucide-react';
+import { ShoppingBag, Phone, Minus, Plus, Check, ChevronsUpDown, ChevronDown, Truck, Store, Link2, MapPin, FileText, CalendarClock, Copy, Cake, UserRoundPlus, Hourglass, X } from 'lucide-react';
 import { MapBody } from './DeliveryMap';
 import { SafeMapsLoader } from '@/lib/mapsLoader';
+import { getStoredCentralPoint, saveCentralPointCoords, syncCentralPointWithBackend } from '@/lib/centralPoint';
 
 const parseCoordsLocal = (url) => {
   if (!url) return null;
@@ -43,7 +44,7 @@ function AddressMiniMapInner({ isLoaded, addressUrl, detectedZone, centralPoint,
     id: '__preview__',
     lat: point.lat, lng: point.lng,
     status: 'pendiente',
-    customer_name: 'Ubicacion',
+    customer_name: 'Cliente',
     order_number: '',
     order_type: 'delivery',
     scheduled_for: null,
@@ -69,31 +70,47 @@ function AddressMiniMapInner({ isLoaded, addressUrl, detectedZone, centralPoint,
             showRoute={!!centralPoint}
             onRouteStatus={setRouteStatus}
           />
-          <div className="pointer-events-none absolute top-1.5 left-1.5 z-10 px-2 py-0.5 rounded-full bg-white/90 border border-[#501122]/15 shadow-sm text-[9px] font-semibold uppercase tracking-wider text-[#78686C]">
-            Arrastra el pin para ajustar
+          <div className="pointer-events-none absolute top-1.5 left-1.5 z-10 px-2.5 py-1 rounded-full bg-white/95 border border-[#501122]/15 shadow-sm text-[10px] font-bold text-[#501122] flex items-center gap-1.5">
+            <MapPin className="h-3 w-3 text-[#C27A29]" />
+            <span>Arrastra el pin para ajustar la ubicación</span>
           </div>
-          {routeStatus === 'fallback' && (
-            <div
-              className="pointer-events-none absolute bottom-1.5 left-1.5 z-10 px-2 py-0.5 rounded-full bg-white/90 border border-amber-500/30 shadow-sm text-[9px] font-semibold uppercase tracking-wider text-amber-700"
-              title="Habilita la API de Directions en Google Cloud para ver la ruta real por calles"
-            >
-              Linea aproximada
+
+          {detectedZone?.distance_km !== undefined && (
+            <div className="pointer-events-none absolute bottom-1.5 left-1.5 z-10 px-2.5 py-1 rounded-full bg-[#501122] text-white shadow-md text-[10px] font-bold flex items-center gap-1.5">
+              <span>Distancia: {detectedZone.distance_km} km</span>
+              {typeof detectedZone?.delivery_cost_usd === 'number' && (
+                <span className="bg-[#C27A29] text-white px-1.5 py-0.5 rounded-md font-extrabold text-[9px]">
+                  ${detectedZone.delivery_cost_usd.toFixed(2)}
+                </span>
+              )}
             </div>
           )}
-          {routeStatus === 'route' && (
-            <div className="pointer-events-none absolute bottom-1.5 left-1.5 z-10 px-2 py-0.5 rounded-full bg-white/90 border border-[#501122]/20 shadow-sm text-[9px] font-semibold uppercase tracking-wider text-[#501122]">
-              Ruta por calles
-            </div>
-          )}
+
           {manualCoords && (
             <button
               type="button"
               onClick={(e) => { e.preventDefault(); onManualPinChange && onManualPinChange(null); }}
-              className="absolute top-1.5 right-1.5 z-10 px-2 py-0.5 rounded-full bg-[#501122] hover:bg-[#3F0D1B] text-white text-[9px] font-semibold uppercase tracking-wider shadow-md transition-colors"
+              className="absolute top-1.5 right-1.5 z-10 px-2.5 py-1 rounded-full bg-[#501122] hover:bg-[#3F0D1B] text-white text-[10px] font-bold uppercase tracking-wider shadow-md transition-colors"
               data-testid="order-form-reset-pin"
               title="Volver al pin del link"
             >
               Restablecer pin
+            </button>
+          )}
+
+          {point && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                saveCentralPointCoords(point.lat, point.lng, addressUrl);
+                toast.success('Ubicación de la tienda guardada permanentemente');
+              }}
+              className="absolute bottom-1.5 right-1.5 z-10 px-2.5 py-1 rounded-full bg-[#3F634A] hover:bg-[#2F4B38] text-white text-[10px] font-bold shadow-md transition-colors flex items-center gap-1"
+              title="Guardar esta posición como la ubicación fija de la tienda"
+            >
+              <Store className="h-3 w-3" />
+              <span>Guardar como Tienda</span>
             </button>
           )}
         </>
@@ -102,14 +119,14 @@ function AddressMiniMapInner({ isLoaded, addressUrl, detectedZone, centralPoint,
       ) : (
         <div className="flex flex-col items-center justify-center h-full gap-1 p-3 text-center">
           <MapPin className="h-6 w-6 text-[#501122]/30" />
-          <p className="text-[10px] text-[#78686C]">Pega el link de Google Maps para ver la ubicacion</p>
+          <p className="text-[10px] text-[#78686C]">Pega el link de Google Maps para ver la ruta desde la tienda</p>
         </div>
       )}
     </div>
   );
 }
 
-function AddressMiniMap(props) {
+export function AddressMiniMap(props) {
   return (
     <SafeMapsLoader>
       {({ isLoaded }) => (
@@ -119,15 +136,25 @@ function AddressMiniMap(props) {
   );
 }
 
-export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
+function normalizeCustomers(data) {
+  if (Array.isArray(data)) return data.filter(Boolean);
+  if (data && Array.isArray(data.customers)) return data.customers.filter(Boolean);
+  return [];
+}
+
+export default function OrderForm({ onSuccess, initialQuote, onCancelQuote, initialCustomer }) {
   const [customers, setCustomers] = useState([]);
   const [flavors, setFlavors] = useState([]);
   const [deliveryUsers, setDeliveryUsers] = useState([]);
   const [bcvRate, setBcvRate] = useState(36.5);
-  const [centralPoint, setCentralPoint] = useState(null);
+  const [centralPoint, setCentralPoint] = useState(() => getStoredCentralPoint());
 
   const [customerOpen, setCustomerOpen] = useState(false);
   const [selectedCustomerId, setSelectedCustomerId] = useState('');
+  const [selectedCustomerObj, setSelectedCustomerObj] = useState(null);
+  const selectedCustomerIdRef = useRef(selectedCustomerId);
+  useEffect(() => { selectedCustomerIdRef.current = selectedCustomerId; }, [selectedCustomerId]);
+
   const [orderItems, setOrderItems] = useState({});
   const [orderType, setOrderType] = useState('delivery');
   const [deliveryAddress, setDeliveryAddress] = useState('');
@@ -169,11 +196,13 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
     const cFlavors = getLocalCache('flavors');
     if (cFlavors) setFlavors(cFlavors.filter(x => x.available));
     const cCust = getLocalCache('customers');
-    if (cCust) setCustomers(cCust);
+    if (cCust) setCustomers(normalizeCustomers(cCust));
     const cUsers = getLocalCache('users');
     if (cUsers) setDeliveryUsers(cUsers.filter(x => x.role === 'delivery'));
     const cSettings = getLocalCache('settings');
     if (cSettings?.exchange_rate_ves) setBcvRate(cSettings.exchange_rate_ves);
+    const storedCp = getStoredCentralPoint();
+    if (storedCp) setCentralPoint(storedCp);
 
     try {
       const [c, f, u, s] = await Promise.all([
@@ -182,29 +211,44 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
         api.get('/users'),
         api.get('/settings'),
       ]);
-      setCustomers(c.data);
-      setLocalCache('customers', c.data);
+      const cList = normalizeCustomers(c.data);
+      setCustomers(prev => {
+        const curSelId = selectedCustomerIdRef.current;
+        const prevList = normalizeCustomers(prev);
+        const sel = prevList.find(x => x.id === curSelId);
+        if (sel && !cList.some(x => x.id === sel.id)) {
+          return [sel, ...cList];
+        }
+        return cList;
+      });
+      setLocalCache('customers', cList);
       setFlavors(f.data.filter(x => x.available));
       setLocalCache('flavors', f.data);
       setDeliveryUsers(u.data.filter(x => x.role === 'delivery'));
       setLocalCache('users', u.data);
       if (s.data?.exchange_rate_ves) setBcvRate(s.data.exchange_rate_ves);
       setLocalCache('settings', s.data);
-      if (typeof s.data?.central_point_lat === 'number' && typeof s.data?.central_point_lng === 'number') {
-        setCentralPoint({ lat: s.data.central_point_lat, lng: s.data.central_point_lng });
-      }
+      syncCentralPointWithBackend(s.data);
+      const activeCp = getStoredCentralPoint();
+      if (activeCp) setCentralPoint(activeCp);
     } catch (e) { console.warn('[OrderForm] data load failed:', e?.message || e); }
   }, []);
 
   useEffect(() => {
     loadData();
-    window.addEventListener('lubos:customers-changed', loadData);
-    window.addEventListener('lubos:flavors-changed', loadData);
-    window.addEventListener('lubos:settings-changed', loadData);
+    const onCustSync = () => loadData();
+    const onFlavSync = () => loadData();
+    const onSetSync = () => {
+      loadData();
+      setCentralPoint(getStoredCentralPoint());
+    };
+    window.addEventListener('lubos:customers-changed', onCustSync);
+    window.addEventListener('lubos:flavors-changed', onFlavSync);
+    window.addEventListener('lubos:settings-changed', onSetSync);
     return () => {
-      window.removeEventListener('lubos:customers-changed', loadData);
-      window.removeEventListener('lubos:flavors-changed', loadData);
-      window.removeEventListener('lubos:settings-changed', loadData);
+      window.removeEventListener('lubos:customers-changed', onCustSync);
+      window.removeEventListener('lubos:flavors-changed', onFlavSync);
+      window.removeEventListener('lubos:settings-changed', onSetSync);
     };
   }, [loadData]);
 
@@ -218,11 +262,12 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
         const { data } = await api.get('/customers', {
           params: term ? { q: term, limit: 50 } : { limit: 25 },
         });
-        // Preserva el cliente seleccionado en la lista si no vino en la busqueda
+        const cList = normalizeCustomers(data);
         setCustomers(prev => {
-          const sel = prev.find(c => c.id === selectedCustomerId);
-          if (sel && !data.some(c => c.id === sel.id)) return [sel, ...data];
-          return data;
+          const prevList = normalizeCustomers(prev);
+          const sel = prevList.find(c => c.id === selectedCustomerId);
+          if (sel && !cList.some(c => c.id === sel.id)) return [sel, ...cList];
+          return cList;
         });
       } catch (e) { console.warn('[OrderForm] customer search failed:', e?.message || e); }
     }, 250);
@@ -264,6 +309,15 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
       } else { setReceiverPhoneLocal(rp); }
     }
   }, [initialQuote]);
+
+  // Pre-select customer if initialCustomer prop is provided
+  useEffect(() => {
+    if (initialCustomer && initialCustomer.id) {
+      setSelectedCustomerId(initialCustomer.id);
+      setSelectedCustomerObj(initialCustomer);
+      setIsQuote(false);
+    }
+  }, [initialCustomer]);
 
   // Auto-detect zone (uses manualCoords override if user dragged the pin)
   useEffect(() => {
@@ -324,84 +378,223 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
 
   const saveNewCustomer = async () => {
     if (!newCustName || !newCustPhone) { toast.error('Completa nombre y telefono'); return; }
+
+    const fullPhone = `${newCustPrefix}${newCustPhone}`;
+    const tempId = `temp_${Date.now()}`;
+    const name = newCustName.trim();
+    const gender = newCustGender;
+
+    const tempCustomer = {
+      id: tempId,
+      name,
+      phone: fullPhone,
+      gender,
+      total_orders: 0,
+      total_spent: 0,
+      created_at: new Date().toISOString(),
+    };
+
+    // 1. INSTANT (0ms): Update local state, select customer, uncheck quote, close dialog
+    setCustomers(prev => [tempCustomer, ...normalizeCustomers(prev).filter(c => String(c.id) !== String(tempId))]);
+    setSelectedCustomerId(tempId);
+    setSelectedCustomerObj(tempCustomer);
+    setIsQuote(false);
+    setShowCustomerDialog(false);
+    setNewCustName('');
+    setNewCustPhone('');
+    setNewCustGender(null);
+    toast.success('Cliente creado');
+
+    // 2. Async persistence in background
     try {
-      const { data } = await api.post('/customers', { name: newCustName, phone: `${newCustPrefix}${newCustPhone}`, gender: newCustGender });
-      toast.success('Cliente creado');
-      setNewCustName(''); setNewCustPhone(''); setNewCustGender(null);
-      setShowCustomerDialog(false);
-      notifyLocalChange('customers_changed');
-      await loadData();
-      setSelectedCustomerId(data.id);
-      setIsQuote(false); // auto-desmarcar cotizacion al crear un cliente nuevo desde aqui
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+      const { data } = await api.post('/customers', { name, phone: fullPhone, gender });
+      
+      // Replace tempId with real DB object in customers array & selectedCustomerId
+      if (data && data.id) {
+        setCustomers(prev => {
+          const list = normalizeCustomers(prev);
+          const filtered = list.filter(c => String(c.id) !== String(tempId) && String(c.id) !== String(data.id));
+          const updated = [data, ...filtered];
+          setLocalCache('customers', updated);
+          return updated;
+        });
+
+        setSelectedCustomerId(prevId => (String(prevId) === String(tempId) ? data.id : prevId));
+        setSelectedCustomerObj(data);
+        notifyLocalChange('customers_changed', { self: true });
+      }
+    } catch (err) {
+      console.error('[saveNewCustomer] Error:', err);
+      // Handle existing customer (409)
+      if (err.response?.status === 409) {
+        try {
+          const { data: searchRes } = await api.get('/customers', { params: { q: fullPhone } });
+          const foundList = normalizeCustomers(searchRes);
+          const existing = foundList.find(c => c.phone && c.phone.replace(/[^0-9]/g, '') === fullPhone.replace(/[^0-9]/g, ''));
+          if (existing) {
+            setCustomers(prev => {
+              const list = normalizeCustomers(prev).filter(c => String(c.id) !== String(tempId));
+              return [existing, ...list.filter(c => String(c.id) !== String(existing.id))];
+            });
+            setSelectedCustomerId(existing.id);
+            setSelectedCustomerObj(existing);
+            setIsQuote(false);
+            toast.info(`Cliente existente seleccionado: ${existing.name}`);
+            return;
+          }
+        } catch (e) {
+          console.warn('Failed to search existing customer:', e);
+        }
+      }
+      // Rollback if request fails
+      setCustomers(prev => normalizeCustomers(prev).filter(c => String(c.id) !== String(tempId)));
+      setSelectedCustomerId(prevId => (String(prevId) === String(tempId) ? '' : prevId));
+      setSelectedCustomerObj(null);
+      toast.error(err.response?.data?.detail || 'Error al guardar cliente');
+    }
   };
 
+  const effectiveIsQuote = orderType === 'tienda' ? false : isQuote;
+
   const submitOrder = async () => {
-    if (!isQuote && !selectedCustomerId) { toast.error('Selecciona un cliente o marca como cotizacion'); return; }
+    if (!effectiveIsQuote && orderType !== 'tienda' && !selectedCustomerId) { toast.error('Selecciona un cliente o marca como cotizacion'); return; }
     const items = Object.values(orderItems).filter(i => i.quantity > 0);
     if (items.length === 0) { toast.error('Agrega al menos un sabor'); return; }
     if (scheduleMode === 'scheduled' && !scheduledFor) { toast.error('Indica fecha y hora programada'); return; }
-    const scheduled_iso = scheduleMode === 'scheduled' && scheduledFor
-      ? new Date(scheduledFor).toISOString() : null;
-    try {
-      // For "retomando" a quote: we always create a new order with the CURRENT form items
-      // (the user may have added/removed sabores) and then delete the original quote.
-      // This avoids reusing the original quote's items.
-      await api.post('/orders', {
-        customer_id: selectedCustomerId || null,
-        items: items.map(i => ({ flavor_id: i.id, flavor_name: i.name, quantity: i.quantity, price_usd: i.price_usd })),
-        order_type: orderType,
-        delivery_address: orderType === 'pickup' ? '' : deliveryAddress,
-        delivery_id: null,
-        delivery_fee: orderType === 'pickup' ? 0 : parseFloat(deliveryFee || 0),
-        notes: orderNotes,
-        is_quote: isQuote,
-        quote_description: isQuote ? (quoteDescription || '').trim() : null,
-        scheduled_for: scheduled_iso,
-        wait_for_notice: waitForNotice,
-        // Manual pin override: only send when user dragged the pin on the mini-map
-        lat: orderType === 'delivery' && manualCoords ? manualCoords.lat : null,
-        lng: orderType === 'delivery' && manualCoords ? manualCoords.lng : null,
-        velitas: velitas,
-        receiver_name: receiverEnabled ? (receiverName || '').trim() || null : null,
-        receiver_phone: receiverEnabled && receiverPhoneLocal
-          ? `${receiverPhonePrefix}${(receiverPhoneLocal || '').replace(/[^0-9]/g, '')}`
-          : null,
-      });
-      // Si estamos retomando una cotizacion, eliminamos la original (se reemplaza por el nuevo pedido/cotizacion actualizado).
-      if (initialQuote) {
-        try { await api.delete(`/quotes/${initialQuote.id}`); }
-        catch (e) { console.warn('No se pudo eliminar la cotizacion original:', e?.message || e); }
+    let scheduled_iso = null;
+    if (scheduleMode === 'scheduled' && scheduledFor) {
+      try {
+        const d = new Date(scheduledFor);
+        if (!isNaN(d.getTime())) {
+          scheduled_iso = d.toISOString();
+        } else {
+          toast.error('Fecha programada inválida');
+          return;
+        }
+      } catch {
+        toast.error('Fecha programada inválida');
+        return;
       }
+    }
 
-      // Dispara evento instantaneo en el cliente y para todas las demas pestanas/dispositivos
-      notifyLocalChange('orders_changed');
-      // Sonido de caja registradora al crear un pedido real (no cotizacion) —
-      // el creador lo escucha inmediatamente, resto de admins/vendors via polling.
-      if (!isQuote) {
-        try { playNotificationSound('new_sale'); } catch { /* ignore */ }
+    const payload = {
+      customer_id: orderType === 'tienda' ? null : (selectedCustomerId || null),
+      items: items.map(i => ({ flavor_id: i.id, flavor_name: i.name, quantity: i.quantity, price_usd: i.price_usd })),
+      order_type: orderType,
+      delivery_address: orderType === 'delivery' ? deliveryAddress : '',
+      delivery_id: null,
+      delivery_fee: orderType === 'delivery' ? parseFloat(deliveryFee || 0) : 0,
+      notes: orderNotes,
+      is_quote: effectiveIsQuote,
+      quote_description: effectiveIsQuote
+        ? (quoteDescription || '').trim()
+        : (initialQuote ? (initialQuote.quote_description || 'Cotización retomada').trim() : null),
+      scheduled_for: scheduled_iso,
+      wait_for_notice: waitForNotice,
+      // Manual pin override: only send when user dragged the pin on the mini-map
+      lat: orderType === 'delivery' && manualCoords ? manualCoords.lat : null,
+      lng: orderType === 'delivery' && manualCoords ? manualCoords.lng : null,
+      velitas: velitas,
+      receiver_name: receiverEnabled ? (receiverName || '').trim() || null : null,
+      receiver_phone: receiverEnabled && receiverPhoneLocal
+        ? `${receiverPhonePrefix}${(receiverPhoneLocal || '').replace(/[^0-9]/g, '')}`
+        : null,
+    };
+
+    const quoteToDeleteId = initialQuote ? initialQuote.id : null;
+    const wasQuote = effectiveIsQuote;
+    const wasInitialQuote = !!initialQuote;
+    const currentOrderType = orderType;
+
+    const selectedCustomer = normalizeCustomers(customers).find(c => c && c.id === selectedCustomerId);
+    const tempId = `temp_${Date.now()}`;
+    const itemsTotal = items.reduce((sum, i) => sum + i.quantity * i.price_usd, 0);
+    const fee = currentOrderType === 'delivery' ? parseFloat(deliveryFee || 0) : 0;
+
+    const optimisticItem = {
+      id: tempId,
+      order_number: wasQuote ? 'COT-NUEVA' : 'PED-NUEVO',
+      customer_id: selectedCustomerId || null,
+      customer_name: selectedCustomer ? selectedCustomer.name : (currentOrderType === 'tienda' ? 'Venta en Tienda' : '(Cotización sin cliente)'),
+      customer_phone: selectedCustomer ? selectedCustomer.phone : (currentOrderType === 'tienda' ? 'N/A' : ''),
+      customer_gender: selectedCustomer ? selectedCustomer.gender : null,
+      items: items.map((it, idx) => ({
+        id: `item_${tempId}_${idx}`,
+        flavor_id: it.id,
+        flavor_name: it.name,
+        quantity: it.quantity,
+        price_usd: it.price_usd
+      })),
+      order_type: currentOrderType,
+      delivery_address: currentOrderType === 'delivery' ? deliveryAddress : '',
+      lat: currentOrderType === 'delivery' && manualCoords ? manualCoords.lat : null,
+      lng: currentOrderType === 'delivery' && manualCoords ? manualCoords.lng : null,
+      delivery_id: null,
+      delivery_name: currentOrderType === 'pickup' ? 'Pickup en tienda' : (currentOrderType === 'tienda' ? 'Venta en tienda' : null),
+      delivery_fee: fee,
+      status: wasQuote ? 'cotizacion' : (currentOrderType === 'tienda' ? 'entregado' : 'pendiente'),
+      is_quote: wasQuote,
+      quote_description: wasQuote ? (quoteDescription || '').trim() : null,
+      scheduled_for: scheduled_iso,
+      wait_for_notice: waitForNotice,
+      total_usd: itemsTotal + fee,
+      items_total: itemsTotal,
+      notes: orderNotes,
+      velitas: velitas,
+      receiver_name: receiverEnabled ? (receiverName || '').trim() || null : null,
+      receiver_phone: receiverEnabled && receiverPhoneLocal ? `${receiverPhonePrefix}${(receiverPhoneLocal || '').replace(/[^0-9]/g, '')}` : null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    // 1. INSTANT (0ms) FEEDBACK: Sound, Toast, Reset & Optimistic UI Insertion
+    if (!wasQuote) {
+      try { playNotificationSound('new_sale'); } catch { /* ignore */ }
+    }
+    toast.success(
+      wasQuote ? (wasInitialQuote ? 'Cotización actualizada' : 'Cotización guardada') :
+      wasInitialQuote ? 'Cotización convertida en pedido' :
+      (currentOrderType === 'tienda' ? 'Venta en tienda creada y entregada' :
+       currentOrderType === 'pickup' ? 'Pedido (pickup) creado' : 'Pedido creado')
+    );
+
+    // Reset panel inputs instantly
+    setSelectedCustomerId(''); setSelectedCustomerObj(null); setOrderItems({}); setDeliveryAddress('');
+    setSelectedDelivery(''); setDeliveryFee(''); setOrderNotes('');
+    setDetectedZone(null); setFeeManuallyEdited(false); setOutOfZoneOverride(false);
+    setManualCoords(null); setWaitForNotice(false);
+    setVelitas(false); setReceiverEnabled(false); setReceiverName(''); setReceiverPhoneLocal('');
+    setOrderType('delivery'); setIsQuote(true); setQuoteDescription('');
+    setScheduleMode('queue'); setScheduledFor('');
+
+    // Instant callback to parent with optimistic item (inserts into list at 0ms!)
+    if (onSuccess) onSuccess(optimisticItem, quoteToDeleteId);
+
+    // 2. BACKGROUND SERVER CREATION
+    (async () => {
+      try {
+        const res = await api.post('/orders', payload);
+        const createdOrder = res.data;
+        if (quoteToDeleteId) {
+          try { await api.delete(`/quotes/${quoteToDeleteId}`); }
+          catch (e) { console.warn('No se pudo eliminar la cotizacion original:', e?.message || e); }
+        }
+        if (onSuccess) onSuccess(createdOrder, quoteToDeleteId);
+        notifyLocalChange('orders_changed');
+        loadData();
+      } catch (err) {
+        console.error('Error al guardar el pedido en el servidor:', err);
+        toast.error(err.response?.data?.detail || 'Error al procesar el pedido en el servidor');
       }
-      toast.success(
-        isQuote ? (initialQuote ? 'Cotizacion actualizada' : 'Cotizacion guardada') :
-        initialQuote ? 'Cotizacion convertida en pedido' :
-        (orderType === 'pickup' ? 'Pedido (pickup) creado' : 'Pedido creado')
-      );
-      setSelectedCustomerId(''); setOrderItems({}); setDeliveryAddress('');
-      setSelectedDelivery(''); setDeliveryFee(''); setOrderNotes('');
-      setDetectedZone(null); setFeeManuallyEdited(false); setOutOfZoneOverride(false);
-      setManualCoords(null);
-      setVelitas(false); setReceiverEnabled(false); setReceiverName(''); setReceiverPhoneLocal('');
-      setOrderType('delivery'); setIsQuote(true); setQuoteDescription('');
-      setScheduleMode('queue'); setScheduledFor('');
-      onSuccess && onSuccess();
-      loadData();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Error'); }
+    })();
   };
 
   const hasItems = Object.keys(orderItems).length > 0;
   const itemsTotal = Object.values(orderItems).reduce((sum, i) => sum + i.quantity * i.price_usd, 0);
   const totalUSD = itemsTotal + (orderType === 'pickup' ? 0 : parseFloat(deliveryFee || 0));
-  const selectedCustomer = customers.find(c => c.id === selectedCustomerId);
+  const selectedCustomer = selectedCustomerId
+    ? (normalizeCustomers(customers).find(c => c && String(c.id) === String(selectedCustomerId)) || (selectedCustomerObj && String(selectedCustomerObj.id) === String(selectedCustomerId) ? selectedCustomerObj : null))
+    : null;
 
   return (
     <div className="lg:pr-[360px] relative">
@@ -502,87 +695,158 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
             </div>
           </div>
           )}
-          <Button onClick={submitOrder} disabled={!hasItems || (!isQuote && !selectedCustomerId) || (orderType === 'delivery' && detectedZone?.reason === 'out_of_zone' && !outOfZoneOverride)}
-            className="w-full bg-[#501122] hover:bg-[#3D0C19] text-white h-12 rounded-full text-sm font-semibold disabled:opacity-40 transition-transform hover:-translate-y-0.5 active:scale-95 shadow-md" data-testid="of-submit">
-            {isQuote ? 'Guardar Cotizacion' : (initialQuote ? 'Convertir en Pedido' : 'Crear Pedido')}
+          <Button onClick={submitOrder} disabled={!hasItems || (!effectiveIsQuote && orderType !== 'tienda' && !selectedCustomerId)}
+            className={`w-full h-12 rounded-full text-sm font-bold disabled:opacity-40 transition-all hover:-translate-y-0.5 active:scale-95 shadow-md ${
+              effectiveIsQuote
+                ? 'bg-[#501122] hover:bg-[#3D0C19] text-white'
+                : 'bg-[#3F634A] hover:bg-[#2E4A37] text-white shadow-lg shadow-[#3F634A]/25 ring-2 ring-[#3F634A]/20'
+            }`} data-testid="of-submit">
+            {effectiveIsQuote ? 'Guardar Cotizacion' : (initialQuote ? 'Convertir en Pedido' : 'Crear Pedido')}
           </Button>
         </div>
       </aside>
 
       {/* LEFT: form column (all inputs flow top to bottom) */}
       <div className="order-1 min-w-0 space-y-5" data-testid="of-form-wrap">
-      {initialQuote && (
-        <div className="bg-red-50 border-2 border-red-300 rounded-2xl p-4 flex items-center justify-between gap-3" data-testid="of-resuming-quote-banner">
+      {initialQuote && (() => {
+        const initialQuoteHasCustomer = !!initialQuote.customer_id;
+        const bannerBgClass = initialQuoteHasCustomer ? 'bg-emerald-50 border-emerald-300' : 'bg-red-50 border-red-300';
+        const iconBgClass = initialQuoteHasCustomer ? 'bg-emerald-500' : 'bg-red-500';
+        const textClass = initialQuoteHasCustomer ? 'text-emerald-700' : 'text-red-700';
+        const subtextClass = initialQuoteHasCustomer ? 'text-emerald-600/80' : 'text-red-600/80';
+        return (
+        <div className={`border-2 rounded-2xl p-4 flex items-center justify-between gap-3 ${bannerBgClass}`} data-testid="of-resuming-quote-banner">
           <div className="flex items-center gap-3 min-w-0">
-            <div className="w-10 h-10 rounded-full bg-red-500 flex items-center justify-center shrink-0">
+            <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${iconBgClass}`}>
               <FileText className="h-5 w-5 text-white" />
             </div>
             <div className="min-w-0">
-              <p className="text-sm font-bold text-red-700">Retomando cotizacion {initialQuote.order_number}</p>
-              <p className="text-[11px] text-red-600/80 truncate">Asigna un cliente y crea el pedido. Los items se cargaron arriba.</p>
+              <p className={`text-sm font-bold ${textClass}`}>Retomando cotizacion {initialQuote.order_number}</p>
+              <p className={`text-[11px] truncate ${subtextClass}`}>Asigna un cliente y crea el pedido. Los items se cargaron arriba.</p>
             </div>
           </div>
           {onCancelQuote && (
-            <button onClick={onCancelQuote} type="button" className="text-xs font-semibold text-red-700 hover:underline px-2" data-testid="of-cancel-quote-btn">Cancelar</button>
+            <button onClick={onCancelQuote} type="button" className={`text-xs font-semibold hover:underline px-2 ${textClass}`} data-testid="of-cancel-quote-btn">Cancelar</button>
           )}
         </div>
-      )}
+        );
+      })()}
 
       {/* Cotizacion ficticia toggle + Cliente en una sola linea */}
       <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-3">
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-2 min-w-0 flex-1">
             <Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]">Cliente</Label>
-            <button onClick={() => setShowCustomerDialog(true)} type="button" className="text-[10px] font-semibold text-[#501122] hover:underline" data-testid="of-new-customer-btn">+ Nuevo</button>
+            {orderType !== 'tienda' && (
+              <button onClick={() => setShowCustomerDialog(true)} type="button" className="text-[10px] font-semibold text-[#501122] hover:underline" data-testid="of-new-customer-btn">+ Nuevo</button>
+            )}
           </div>
-          <button type="button" onClick={() => setIsQuote(v => !v)} data-testid="of-quote-toggle"
-            className={`flex items-center gap-2 h-8 px-3 rounded-full border text-[11px] font-bold uppercase tracking-wider transition-all
-              ${isQuote ? 'bg-red-50 border-red-300 text-red-700' : 'bg-white border-[#501122]/15 text-[#78686C]'}`}>
-            <FileText className="h-3.5 w-3.5" />
-            Solo cotizacion
-            <span className={`w-8 h-4 rounded-full p-0.5 transition-colors shrink-0 ${isQuote ? 'bg-red-500' : 'bg-[#501122]/15'}`}>
-              <span className={`block w-3 h-3 rounded-full bg-white shadow transition-transform ${isQuote ? 'translate-x-4' : 'translate-x-0'}`}></span>
-            </span>
-          </button>
+          {orderType !== 'tienda' && (() => {
+            const isRegisteredQuote = isQuote && !!selectedCustomerId;
+            const toggleBtnClass = isQuote
+              ? (isRegisteredQuote ? 'bg-emerald-50 border-emerald-300 text-emerald-700' : 'bg-red-50 border-red-300 text-red-700')
+              : 'bg-white border-[#501122]/15 text-[#78686C]';
+            const switchBgClass = isQuote
+              ? (isRegisteredQuote ? 'bg-emerald-500' : 'bg-red-500')
+              : 'bg-[#501122]/15';
+            return (
+              <button type="button" onClick={() => setIsQuote(v => !v)} data-testid="of-quote-toggle"
+                className={`flex items-center gap-2 h-8 px-3 rounded-full border text-[11px] font-bold uppercase tracking-wider transition-all ${toggleBtnClass}`}>
+                <FileText className="h-3.5 w-3.5" />
+                Solo cotizacion
+                <span className={`w-8 h-4 rounded-full p-0.5 transition-colors shrink-0 ${switchBgClass}`}>
+                  <span className={`block w-3 h-3 rounded-full bg-white shadow transition-transform ${isQuote ? 'translate-x-4' : 'translate-x-0'}`}></span>
+                </span>
+              </button>
+            );
+          })()}
         </div>
-        <Popover open={customerOpen} onOpenChange={setCustomerOpen}>
-          <PopoverTrigger asChild>
-            <Button variant="outline" role="combobox" data-testid="of-customer-select"
-              className="w-full justify-between h-12 bg-white border-[#501122]/15 text-[#1F1517] hover:bg-[#F3EBE0] rounded-2xl">
-              {selectedCustomer ? `${selectedCustomer.name} - ${selectedCustomer.phone}` : 'Buscar cliente...'}
-              <ChevronsUpDown className="ml-2 h-4 w-4 opacity-40" />
-            </Button>
-          </PopoverTrigger>
-          <PopoverContent className="w-[--radix-popover-trigger-width] p-0 rounded-2xl border-[#501122]/10">
-            <Command shouldFilter={false}>
-              <CommandInput
-                placeholder="Escribir nombre o telefono..."
-                value={customerSearch}
-                onValueChange={setCustomerSearch}
-                data-testid="of-customer-search"
-              />
-              <CommandList>
-                <CommandEmpty>No se encontro.</CommandEmpty>
-                <CommandGroup>
-                  {customers.map(c => (
-                    <CommandItem
-                      key={c.id}
-                      value={`${c.name} ${c.phone}`}
-                      onSelect={() => {
-                        setSelectedCustomerId(c.id);
-                        setIsQuote(false); // auto-desmarcar cotizacion al elegir un cliente
-                        setCustomerOpen(false);
-                      }}
-                    >
-                      <Check className={`mr-2 h-4 w-4 ${selectedCustomerId === c.id ? 'opacity-100' : 'opacity-0'}`} />
-                      <div>{c.name}<span className="ml-2 text-xs text-[#78686C]"><Phone className="h-3 w-3 inline mr-1" />{c.phone}</span></div>
-                    </CommandItem>
-                  ))}
-                </CommandGroup>
-              </CommandList>
-            </Command>
-          </PopoverContent>
-        </Popover>
+        {orderType === 'tienda' ? (
+          <div className="bg-emerald-50 border border-emerald-200/80 rounded-2xl p-3 flex items-center justify-between text-xs text-emerald-900 font-medium" data-testid="of-tienda-no-customer">
+            <div className="flex items-center gap-2">
+              <Store className="h-4 w-4 text-emerald-700 shrink-0" />
+              <span>Venta en Tienda: <strong className="font-bold">No se requiere cliente</strong></span>
+            </div>
+            <span className="text-[10px] text-emerald-700 font-bold uppercase tracking-wide bg-emerald-100 px-2 py-0.5 rounded-md shrink-0">Venta Directa</span>
+          </div>
+        ) : (
+          <div className="flex gap-2 w-full">
+            <div className="flex-1 min-w-0">
+              <Popover open={customerOpen} onOpenChange={setCustomerOpen}>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" role="combobox" data-testid="of-customer-select"
+                    className="w-full justify-between h-12 bg-white border-[#501122]/15 text-[#1F1517] hover:bg-[#F3EBE0] rounded-2xl">
+                    <span className="truncate">
+                      {selectedCustomer ? `${selectedCustomer.name} - ${selectedCustomer.phone}` : 'Buscar cliente...'}
+                    </span>
+                    <ChevronsUpDown className="ml-2 h-4 w-4 opacity-40 shrink-0" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-[--radix-popover-trigger-width] p-0 rounded-2xl border-[#501122]/10">
+                  <Command shouldFilter={false}>
+                    <CommandInput
+                      placeholder="Escribir nombre o telefono..."
+                      value={customerSearch}
+                      onValueChange={setCustomerSearch}
+                      data-testid="of-customer-search"
+                    />
+                    <CommandList>
+                      <CommandEmpty>No se encontro.</CommandEmpty>
+                      {selectedCustomer && (
+                        <CommandGroup>
+                          <CommandItem
+                            value="sin_cliente_deselect"
+                            onSelect={() => {
+                              setSelectedCustomerId('');
+                              setSelectedCustomerObj(null);
+                              setCustomerOpen(false);
+                            }}
+                            className="text-red-600 font-semibold cursor-pointer"
+                          >
+                            <X className="mr-2 h-4 w-4 text-red-600" />
+                            <span>Sin cliente (Quitar selección)</span>
+                          </CommandItem>
+                        </CommandGroup>
+                      )}
+                      <CommandGroup>
+                        {normalizeCustomers(customers).map(c => (
+                          <CommandItem
+                            key={c.id}
+                            value={`${c.name} ${c.phone}`}
+                            onSelect={() => {
+                              setSelectedCustomerId(c.id);
+                              setSelectedCustomerObj(c);
+                              setIsQuote(false); // auto-desmarcar cotizacion al elegir un cliente
+                              setCustomerOpen(false);
+                            }}
+                          >
+                            <Check className={`mr-2 h-4 w-4 ${selectedCustomerId === c.id ? 'opacity-100' : 'opacity-0'}`} />
+                            <div>{c.name}<span className="ml-2 text-xs text-[#78686C]"><Phone className="h-3 w-3 inline mr-1" />{c.phone}</span></div>
+                          </CommandItem>
+                        ))}
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
+            </div>
+            {selectedCustomer && (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setSelectedCustomerId('');
+                  setSelectedCustomerObj(null);
+                }}
+                className="h-12 w-12 rounded-2xl border-[#501122]/15 text-[#78686C] hover:text-[#501122] hover:bg-[#F3EBE0] flex items-center justify-center shrink-0"
+                title="Quitar cliente seleccionado"
+                data-testid="of-customer-clear-btn"
+              >
+                <X className="h-4.5 w-4.5" />
+              </Button>
+            )}
+          </div>
+        )}
         {isQuote && (
           <Input
             type="text"
@@ -608,26 +872,30 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
             const atMax = !f.stock_unlimited && qty >= (f.stock || 0);
             return (
               <div key={f.id} data-testid={`of-flavor-${f.id}`}
-                className={`p-4 rounded-2xl border-2 transition-all duration-300 ${qty > 0 ? 'border-[#501122] bg-[#501122]/[0.03]' : 'border-[#501122]/10 bg-white'} ${noStock ? 'opacity-70' : ''}`}>
-                <div className="flex justify-between items-center gap-3">
-                  <div className="flex items-center gap-3 min-w-0 flex-1">
-                    {f.image ? (
-                      <img src={f.image} alt={f.name} className="w-12 h-12 rounded-xl object-cover border border-[#501122]/10 shrink-0" />
-                    ) : (
-                      <div className="w-12 h-12 rounded-xl bg-[#F3EBE0] flex items-center justify-center shrink-0"><span className="font-heading text-[#501122] text-sm">{(f.name || '?')[0]}</span></div>
-                    )}
-                    <div className="min-w-0">
-                      <p className="font-heading text-[#501122] text-sm truncate">{f.name}</p>
-                      <p className="text-sm font-bold text-[#501122]">{formatUSD(f.price_usd)}</p>
-                      <p className="text-[10px] mt-0.5">
-                        {f.stock_unlimited ? <span className="text-[#78686C]">Por pedido</span> : (noStock ? <span className="text-red-600 font-bold uppercase tracking-wider">Agotado</span> : <span className="text-[#78686C]">{f.stock || 0} disp.</span>)}
-                      </p>
-                    </div>
+                className={`h-20 overflow-hidden rounded-2xl border-2 flex transition-all duration-300 ${qty > 0 ? 'border-[#501122] bg-[#501122]/[0.03]' : 'border-[#501122]/10 bg-white'} ${noStock ? 'opacity-70' : ''}`}>
+                
+                {/* Left Side: Image covering the entire left section as a perfect 1:1 square */}
+                <div className="w-20 h-full shrink-0 relative bg-[#F3EBE0] border-r border-[#501122]/5">
+                  {f.image ? (
+                    <img src={f.image} alt={f.name} className="w-full h-full object-cover absolute inset-0" referrerPolicy="no-referrer" />
+                  ) : (
+                    <div className="absolute inset-0 flex items-center justify-center bg-[#F3EBE0]"><span className="font-heading text-[#501122] text-base font-bold">{(f.name || '?')[0]}</span></div>
+                  )}
+                </div>
+
+                {/* Right Side: Rest of the information and controls */}
+                <div className="flex-1 min-w-0 p-2.5 flex items-center justify-between gap-2.5 h-full">
+                  <div className="min-w-0 flex-1 flex flex-col justify-center">
+                    <p className="font-heading text-[#501122] text-base truncate font-bold pr-1" title={f.name}>{f.name}</p>
+                    <p className="text-sm font-bold text-[#501122]">{formatUSD(f.price_usd)}</p>
+                    <p className="text-[10px] mt-0.5">
+                      {f.stock_unlimited ? <span className="text-[#78686C]">Por pedido</span> : (noStock ? <span className="text-red-600 font-bold uppercase tracking-wider">Agotado</span> : <span className="text-[#78686C]">{f.stock || 0} disp.</span>)}
+                    </p>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {qty > 0 && <button type="button" onClick={() => removeFlavor(f.id)} className="w-10 h-10 rounded-full bg-[#F3EBE0] flex items-center justify-center active:scale-90"><Minus className="h-4 w-4 text-[#501122]" /></button>}
-                    {qty > 0 && <span className="font-heading text-[#501122] w-6 text-center text-lg">{qty}</span>}
-                    <button type="button" onClick={() => addFlavor(f)} disabled={noStock || atMax} className="w-10 h-10 rounded-full bg-[#501122] text-white flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed active:scale-90"><Plus className="h-4 w-4" /></button>
+                  <div className="flex items-center gap-1 shrink-0 pl-1">
+                    {qty > 0 && <button type="button" onClick={() => removeFlavor(f.id)} className="w-7 h-7 rounded-full bg-[#F3EBE0] flex items-center justify-center active:scale-90 transition-transform"><Minus className="h-3 w-3 text-[#501122]" /></button>}
+                    {qty > 0 && <span className="font-heading text-[#501122] w-4 text-center text-xs font-bold">{qty}</span>}
+                    <button type="button" onClick={() => addFlavor(f)} disabled={noStock || atMax} className="w-7 h-7 rounded-full bg-[#501122] text-white flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed active:scale-90 transition-all"><Plus className="h-3 w-3" /></button>
                   </div>
                 </div>
               </div>
@@ -665,14 +933,18 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
       <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-5 shadow-[0_8px_30px_rgba(80,17,34,0.03)] space-y-4">
         <div>
           <Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C] mb-2 block">Tipo de entrega</Label>
-          <div className="flex gap-2 bg-[#F0E4D8] rounded-full p-1 w-fit">
-            <button onClick={() => setOrderType('delivery')} data-testid="of-type-delivery"
+          <div className="flex flex-wrap gap-2 bg-[#F0E4D8] rounded-full p-1 w-fit">
+            <button type="button" onClick={() => setOrderType('delivery')} data-testid="of-type-delivery"
               className={`flex items-center gap-2 px-5 py-2.5 rounded-full text-sm font-semibold transition-all ${orderType === 'delivery' ? 'bg-[#501122] text-white shadow-md' : 'text-[#78686C]'}`}>
               <Truck className="h-4 w-4" />Delivery
             </button>
-            <button onClick={() => setOrderType('pickup')} data-testid="of-type-pickup"
+            <button type="button" onClick={() => setOrderType('pickup')} data-testid="of-type-pickup"
               className={`flex items-center gap-2 px-5 py-2.5 rounded-full text-sm font-semibold transition-all ${orderType === 'pickup' ? 'bg-[#501122] text-white shadow-md' : 'text-[#78686C]'}`}>
               <ShoppingBag className="h-4 w-4" />Pickup
+            </button>
+            <button type="button" onClick={() => { setOrderType('tienda'); setIsQuote(false); }} data-testid="of-type-tienda"
+              className={`flex items-center gap-2 px-5 py-2.5 rounded-full text-sm font-semibold transition-all ${orderType === 'tienda' ? 'bg-emerald-700 text-white shadow-md' : 'text-[#78686C]'}`}>
+              <Store className="h-4 w-4" />Tienda
             </button>
           </div>
         </div>
@@ -704,36 +976,21 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
                     <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-3 space-y-1.5" data-testid="of-route-failed">
                       <p className="text-sm font-bold text-amber-800">No se pudo calcular la ruta</p>
                       <p className="text-[11px] text-amber-700">Google Maps no respondio. Cambia el toggle a <span className="font-bold">&ldquo;Linea recta&rdquo;</span> para una estimacion aproximada.</p>
-                      {detectedZone.linear_distance_km !== undefined && (
+                      {detectedZone?.linear_distance_km !== undefined && (
                         <p className="text-[10px] text-amber-700">Linea recta: {detectedZone.linear_distance_km} km &middot; ~${detectedZone.linear_cost_usd?.toFixed(2)}</p>
                       )}
                     </div>
-                  ) : detectedZone?.matched ? (
+                  ) : detectedZone?.distance_km !== undefined ? (
                     <div className="bg-[#3F634A]/10 border border-[#3F634A]/20 rounded-2xl p-3 flex items-center gap-3">
-                      <div className="w-9 h-9 rounded-full flex items-center justify-center shrink-0" style={{ background: detectedZone.color || '#3F634A' }}>
+                      <div className="w-9 h-9 rounded-full flex items-center justify-center shrink-0 bg-[#3F634A]">
                         <MapPin className="h-4 w-4 text-white" />
                       </div>
                       <div className="flex-1 min-w-0">
-                        <p className="text-xs font-semibold text-[#501122]">{detectedZone.name || 'Dentro de cobertura'}</p>
-                        {detectedZone.distance_km !== undefined && (
-                          <p className="text-[10px] text-[#78686C]">
-                            {detectedZone.distance_km} km {detectedZone.distance_source === 'linear' ? '(linea recta)' : '(ruta)'} &middot; <span className="font-bold text-[#3F634A]">${detectedZone.delivery_cost_usd?.toFixed(2)}</span>
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  ) : detectedZone?.reason === 'out_of_zone' ? (
-                    <div className="bg-red-50 border-2 border-red-300 rounded-2xl p-3 space-y-2">
-                      <p className="text-sm font-bold text-red-700">Fuera del area</p>
-                      {detectedZone.distance_km !== undefined && (
-                        <p className="text-[11px] text-red-700">
-                          Distancia: {detectedZone.distance_km} km &middot; Costo sugerido: <span className="font-bold">${detectedZone.delivery_cost_usd?.toFixed(2)}</span>
+                        <p className="text-xs font-semibold text-[#501122]">Costo de delivery calculated</p>
+                        <p className="text-[10px] text-[#78686C]">
+                          {detectedZone.distance_km} km {detectedZone.distance_source === 'linear' ? '(linea recta)' : '(ruta)'} &middot; <span className="font-bold text-[#3F634A]">${detectedZone.delivery_cost_usd?.toFixed(2)}</span>
                         </p>
-                      )}
-                      <label className="flex items-center gap-2 text-[10px] text-red-700 cursor-pointer">
-                        <input type="checkbox" checked={outOfZoneOverride} onChange={(e) => setOutOfZoneOverride(e.target.checked)} className="w-4 h-4 accent-red-500" />
-                        <span className="font-semibold">Crear de todas formas</span>
-                      </label>
+                      </div>
                     </div>
                   ) : null}
                 </div>
@@ -752,7 +1009,7 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
               </div>
             </div>
           </>
-        ) : (
+        ) : orderType === 'pickup' ? (
           <>
           <div className="bg-[#C27A29]/10 border border-[#C27A29]/20 rounded-2xl p-4 flex items-center gap-3">
             <div className="w-10 h-10 rounded-full bg-[#C27A29] flex items-center justify-center shrink-0"><ShoppingBag className="h-5 w-5 text-white" /></div>
@@ -767,45 +1024,69 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
               placeholder="Instrucciones..." className="bg-white border-[#501122]/15 rounded-2xl resize-none" data-testid="of-notes" />
           </div>
           </>
+        ) : (
+          /* orderType === 'tienda' */
+          <div className="bg-emerald-50 border border-emerald-200/80 rounded-2xl p-4 flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-emerald-700 flex items-center justify-center shrink-0 shadow-xs">
+              <Store className="h-5 w-5 text-white" />
+            </div>
+            <div>
+              <p className="text-sm font-bold text-emerald-900">Venta directa en Tienda</p>
+              <p className="text-[11px] text-emerald-700">Venta presencial directa en el local. Sin despacho ni dirección de delivery.</p>
+            </div>
+          </div>
         )}
 
-        {/* Extras: Velitas + Recibe otra persona (una sola línea horizontal) */}
-        <div className="flex flex-wrap items-center gap-2" data-testid="of-extras-row">
-          <button type="button" onClick={() => setVelitas(v => !v)} data-testid="of-velitas-toggle"
-            className={`flex items-center gap-2 h-11 px-3 rounded-2xl border text-sm font-semibold transition-all shrink-0
-              ${velitas ? 'bg-[#C27A29]/10 border-[#C27A29]/40 text-[#C27A29]' : 'bg-white border-[#501122]/15 text-[#78686C]'}`}>
-            <Cake className="h-4 w-4" />Velitas
-            <span className={`w-8 h-4 rounded-full p-0.5 transition-colors shrink-0 ${velitas ? 'bg-[#C27A29]' : 'bg-[#501122]/15'}`}>
-              <span className={`block w-3 h-3 rounded-full bg-white shadow transition-transform ${velitas ? 'translate-x-4' : 'translate-x-0'}`}></span>
-            </span>
-          </button>
-          <button type="button" onClick={() => setReceiverEnabled(v => !v)} data-testid="of-receiver-toggle"
-            className={`flex items-center gap-2 h-11 px-3 rounded-2xl border text-sm font-semibold transition-all shrink-0
-              ${receiverEnabled ? 'bg-[#501122]/10 border-[#501122]/40 text-[#501122]' : 'bg-white border-[#501122]/15 text-[#78686C]'}`}>
-            <UserRoundPlus className="h-4 w-4" />Recibe otra persona
-            <span className={`w-8 h-4 rounded-full p-0.5 transition-colors shrink-0 ${receiverEnabled ? 'bg-[#501122]' : 'bg-[#501122]/15'}`}>
-              <span className={`block w-3 h-3 rounded-full bg-white shadow transition-transform ${receiverEnabled ? 'translate-x-4' : 'translate-x-0'}`}></span>
-            </span>
-          </button>
-          {receiverEnabled && (
-            <>
-              <Input value={receiverName} onChange={(e) => setReceiverName(e.target.value)}
-                placeholder="Nombre" className="bg-white border-[#501122]/15 h-11 rounded-2xl px-3 w-40 flex-1 min-w-[140px]" data-testid="of-receiver-name" />
-              <div className="flex gap-1 shrink-0">
-                <Input value={receiverPhonePrefix} onChange={(e) => setReceiverPhonePrefix(e.target.value)}
-                  className="bg-white border-[#501122]/15 h-11 rounded-2xl px-2 w-16 text-center text-sm" data-testid="of-receiver-phone-prefix" />
-                <Input value={receiverPhoneLocal} onChange={(e) => setReceiverPhoneLocal(e.target.value.replace(/[^0-9]/g, ''))}
-                  placeholder="4121234567" className="bg-white border-[#501122]/15 h-11 rounded-2xl px-3 w-40" data-testid="of-receiver-phone" />
-              </div>
-            </>
-          )}
-        </div>
+        {/* Extras & Opciones secundarias (Opacadas cuando es venta en Tienda) */}
+        <div className={`space-y-4 transition-all duration-300 ${orderType === 'tienda' ? 'opacity-35 hover:opacity-100 focus-within:opacity-100' : ''}`}>
+          {/* Extras: Velitas + Recibe otra persona */}
+          <div className="flex flex-wrap items-center gap-2" data-testid="of-extras-row">
+            <button type="button" onClick={() => setVelitas(v => !v)} data-testid="of-velitas-toggle"
+              className={`flex items-center gap-2 h-11 px-3 rounded-2xl border text-sm font-semibold transition-all shrink-0
+                ${velitas ? 'bg-[#C27A29]/10 border-[#C27A29]/40 text-[#C27A29]' : 'bg-white border-[#501122]/15 text-[#78686C]'}`}>
+              <Cake className="h-4 w-4" />Velitas
+              <span className={`w-8 h-4 rounded-full p-0.5 transition-colors shrink-0 ${velitas ? 'bg-[#C27A29]' : 'bg-[#501122]/15'}`}>
+                <span className={`block w-3 h-3 rounded-full bg-white shadow transition-transform ${velitas ? 'translate-x-4' : 'translate-x-0'}`}></span>
+              </span>
+            </button>
+            {orderType !== 'tienda' && (
+              <button type="button" onClick={() => setReceiverEnabled(v => !v)} data-testid="of-receiver-toggle"
+                className={`flex items-center gap-2 h-11 px-3 rounded-2xl border text-sm font-semibold transition-all shrink-0
+                  ${receiverEnabled ? 'bg-[#501122]/10 border-[#501122]/40 text-[#501122]' : 'bg-white border-[#501122]/15 text-[#78686C]'}`}>
+                <UserRoundPlus className="h-4 w-4" />Recibe otra persona
+                <span className={`w-8 h-4 rounded-full p-0.5 transition-colors shrink-0 ${receiverEnabled ? 'bg-[#501122]' : 'bg-[#501122]/15'}`}>
+                  <span className={`block w-3 h-3 rounded-full bg-white shadow transition-transform ${receiverEnabled ? 'translate-x-4' : 'translate-x-0'}`}></span>
+                </span>
+              </button>
+            )}
+            {orderType !== 'tienda' && receiverEnabled && (
+              <>
+                <Input value={receiverName} onChange={(e) => setReceiverName(e.target.value)}
+                  placeholder="Nombre" className="bg-white border-[#501122]/15 h-11 rounded-2xl px-3 w-40 flex-1 min-w-[140px]" data-testid="of-receiver-name" />
+                <div className="flex gap-1 shrink-0">
+                  <Input value={receiverPhonePrefix} onChange={(e) => setReceiverPhonePrefix('+' + e.target.value.replace(/\D/g, ''))}
+                    className="bg-white border-[#501122]/15 h-11 rounded-2xl px-2 w-16 text-center text-sm font-medium" data-testid="of-receiver-phone-prefix" />
+                  <Input value={receiverPhoneLocal} onChange={(e) => setReceiverPhoneLocal(e.target.value.replace(/[^0-9]/g, ''))}
+                    placeholder="4121234567" className="bg-white border-[#501122]/15 h-11 rounded-2xl px-3 w-40" data-testid="of-receiver-phone" />
+                </div>
+              </>
+            )}
+          </div>
 
-        {/* Fecha de entrega (En Cola vs Programada vs De esperar aviso) */}
-        <div className="space-y-2">
-          <Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C] flex items-center gap-1.5">
-            <CalendarClock className="h-3.5 w-3.5" />Fecha de entrega
-          </Label>
+          {/* Notas para Tienda */}
+          {orderType === 'tienda' && (
+            <div className="space-y-1.5">
+              <Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C]">Notas adicionales (opcional)</Label>
+              <Textarea value={orderNotes} onChange={(e) => setOrderNotes(e.target.value)} rows={2}
+                placeholder="Ej: Cliente pago en efectivo..." className="bg-white border-[#501122]/15 rounded-2xl resize-none" data-testid="of-notes-tienda" />
+            </div>
+          )}
+
+          {/* Fecha de entrega (En Cola vs Programada vs De esperar aviso) */}
+          <div className="space-y-2">
+            <Label className="text-xs font-semibold uppercase tracking-[0.1em] text-[#78686C] flex items-center gap-1.5">
+              <CalendarClock className="h-3.5 w-3.5" />Fecha de entrega
+            </Label>
           <div className="flex flex-wrap gap-2 bg-[#F0E4D8] rounded-2xl p-1.5 w-fit">
             <button type="button" onClick={() => { setScheduleMode('queue'); setScheduledFor(''); setWaitForNotice(false); }} data-testid="of-schedule-queue"
               className={`px-4 py-2 rounded-full text-xs font-semibold transition-all ${scheduleMode === 'queue' && !waitForNotice ? 'bg-[#501122] text-white shadow-md' : 'text-[#78686C]'}`}>
@@ -840,6 +1121,7 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
           )}
         </div>
       </div>
+      </div>
       </div>{/* /right form column */}
 
       {/* New Customer Dialog */}
@@ -849,10 +1131,12 @@ export default function OrderForm({ onSuccess, initialQuote, onCancelQuote }) {
           <div className="space-y-3">
             <Input value={newCustName} onChange={(e) => setNewCustName(e.target.value)} placeholder="Nombre" className="bg-[#F3EBE0] border-[#501122]/10 h-12 rounded-2xl px-4" data-testid="of-newcust-name" />
             <div className="flex gap-2">
-              <Select value={newCustPrefix} onValueChange={setNewCustPrefix}>
-                <SelectTrigger className="w-24 bg-[#F3EBE0] border-[#501122]/10 h-12 rounded-2xl"><SelectValue /></SelectTrigger>
-                <SelectContent className="rounded-2xl"><SelectItem value="+58">+58</SelectItem><SelectItem value="+1">+1</SelectItem><SelectItem value="+57">+57</SelectItem><SelectItem value="+34">+34</SelectItem></SelectContent>
-              </Select>
+              <Input 
+                value={newCustPrefix} 
+                onChange={(e) => setNewCustPrefix('+' + e.target.value.replace(/\D/g, ''))}
+                className="w-20 bg-[#F3EBE0] border-[#501122]/10 text-[#1F1517] h-12 rounded-2xl px-2 text-center font-medium" 
+                data-testid="of-newcust-prefix" 
+              />
               <Input value={newCustPhone} onChange={(e) => setNewCustPhone(e.target.value.replace(/\D/g, ''))} placeholder="4124567890" className="bg-[#F3EBE0] border-[#501122]/10 h-12 rounded-2xl px-4 flex-1" data-testid="of-newcust-phone" />
             </div>
             <div className="flex gap-2">

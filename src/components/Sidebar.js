@@ -67,12 +67,16 @@ export default function Sidebar({ items, activeId, onSelect, testIdPrefix = 'nav
 
   const loadRate = useCallback(async () => {
     const cSettings = getLocalCache('settings');
-    if (cSettings?.exchange_rate_ves) setRate(cSettings.exchange_rate_ves);
+    if (cSettings && cSettings.exchange_rate_ves) {
+      setRate(cSettings.exchange_rate_ves);
+    }
 
     try {
       const { data } = await api.get('/settings');
-      setRate(data.exchange_rate_ves);
-      setLocalCache('settings', data);
+      if (data && data.exchange_rate_ves) {
+        setRate(data.exchange_rate_ves);
+        setLocalCache('settings', data);
+      }
     } catch { /* ignore */ }
   }, []);
 
@@ -123,16 +127,20 @@ export default function Sidebar({ items, activeId, onSelect, testIdPrefix = 'nav
         <div className="flex flex-col items-center gap-2 pb-2.5 border-b border-[#501122]/10 w-full">
           {!collapsed ? (
             <div className="flex items-center justify-between w-full px-0.5">
-              <img src="/logo.svg" alt="Lubo's" className="h-7 w-auto" data-testid="sidebar-logo" />
+              <img src="/logo.svg" alt="Lubo's" className="h-7 max-h-7 w-auto object-contain" data-testid="sidebar-logo" />
               <span className="text-[9px] font-extrabold uppercase tracking-wider bg-[#501122]/10 text-[#501122] px-2 py-0.5 rounded-full" data-testid="sidebar-user-role">
                 {roleLabels[user?.role] || user?.role}
               </span>
             </div>
           ) : (
             <div className="flex items-center justify-center py-0.5">
-              <span className="text-sm font-black font-heading text-[#501122] bg-[#501122]/10 w-8 h-8 rounded-xl flex items-center justify-center shadow-2xs" title="Lubo's Tiramisú">
-                L
-              </span>
+              <img
+                src="/isotipo-collapsed.svg"
+                alt="Lubo's"
+                className="w-8 h-8 object-contain rounded-xl shadow-2xs shrink-0"
+                title="Lubo's Tiramisú"
+                data-testid="sidebar-logo-collapsed"
+              />
             </div>
           )}
 

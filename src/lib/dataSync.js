@@ -1,3 +1,5 @@
+import { preloadGoogleMapsScript } from '@/lib/mapsLoader';
+
 // Real-time synchronization service via Server-Sent Events (SSE) + BroadcastChannel
 let eventSource = null;
 let broadcastChannel = null;
@@ -33,6 +35,9 @@ function dispatchLocalEvent(eventType, payload) {
     if (eventType === 'customers_changed') {
       window.dispatchEvent(new CustomEvent('lubos:customers-changed', { detail: payload }));
     }
+    if (eventType === 'location_update' || eventType === 'driver_location_changed') {
+      window.dispatchEvent(new CustomEvent('lubos:location_update', { detail: payload }));
+    }
     window.dispatchEvent(new CustomEvent('lubos:data-updated', { detail: { event: eventType, payload } }));
   } catch (e) {
     console.warn('[dataSync] error dispatching event:', e);
@@ -40,13 +45,15 @@ function dispatchLocalEvent(eventType, payload) {
 }
 
 export function notifyLocalChange(eventType, payload = {}) {
-  // 1. Dispatch locally in current window
-  dispatchLocalEvent(eventType, payload);
+  const fullPayload = typeof payload === 'object' && payload !== null ? payload : { value: payload };
+  // 1. Dispatch locally in current window (preserves self: true for local optimistic updates)
+  dispatchLocalEvent(eventType, fullPayload);
 
-  // 2. Broadcast to other tabs on same device
+  // 2. Broadcast to other tabs on same device (strips self: true so other tabs know to sync)
   if (broadcastChannel) {
     try {
-      broadcastChannel.postMessage({ event: eventType, payload, timestamp: Date.now() });
+      const { self, ...broadcastPayload } = fullPayload;
+      broadcastChannel.postMessage({ event: eventType, payload: broadcastPayload, timestamp: Date.now() });
     } catch (e) {
       console.warn('[dataSync] BroadcastChannel postMessage error:', e);
     }
@@ -55,6 +62,7 @@ export function notifyLocalChange(eventType, payload = {}) {
 
 export function initDataSync() {
   if (typeof window === 'undefined') return;
+  preloadGoogleMapsScript();
   if (eventSource) return; // already connected
 
   const backendUrl = (typeof process !== 'undefined' && process.env?.REACT_APP_BACKEND_URL) || 

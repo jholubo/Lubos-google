@@ -17,6 +17,7 @@ model User {
   location_lat    Float?
   location_lng    Float?
   location_updated_at DateTime?
+  color           String?
   created_at      DateTime  @default(now())
 }
 
@@ -129,6 +130,13 @@ model AppSettings {
   central_point_url   String?
   central_point_lat   Float?
   central_point_lng   Float?
+  logo_url            String?
+  favicon_url         String?
+  font_family         String?  @default("Playfair Display")
+  primary_color       String?  @default("#501122")
+  secondary_color     String?  @default("#FBF7F0")
+  app_title           String?  @default("Lubo's Tiramisú")
+  app_subtitle        String?  @default("Gestión y Logística")
   updated_at          DateTime @updatedAt
 }
 

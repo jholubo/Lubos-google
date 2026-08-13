@@ -4,11 +4,11 @@ import { toast } from 'sonner';
 import { useAuth } from '@/contexts/AuthContext';
 import api, { formatUSD, formatVES } from '@/lib/api';
 import { getLocalCache, setLocalCache } from '@/lib/cache';
+import { getStoredCentralPoint, syncCentralPointWithBackend } from '@/lib/centralPoint';
 import { notifyLocalChange } from '@/lib/dataSync';
 import { useNotifications } from '@/hooks/useNotifications';
 import usePushSubscription from '@/hooks/usePushSubscription';
 import DeliveryMap from '@/components/DeliveryMap';
-import DeliveryNavigationMap from '@/components/DeliveryNavigationMap';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { MessageCircle, MapPin, Check, Truck, Package, BarChart3, Undo2, DollarSign, CheckCircle2, Clock, Calendar, TrendingUp, Phone, ChevronDown, ChevronUp, ShoppingBag, Cake, Hourglass, LogOut, Volume2, VolumeX, Menu, X, Navigation, ExternalLink } from 'lucide-react';
@@ -42,51 +42,27 @@ export default function DeliveryDashboard() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [activeSection, setActiveSection] = useState('disponibles');
-  const [orders, setOrders] = useState([]);
-  const [availableOrders, setAvailableOrders] = useState([]);
+  const [orders, setOrders] = useState(() => getLocalCache('delivery_my_orders') || []);
+  const [availableOrders, setAvailableOrders] = useState(() => getLocalCache('delivery_avail_orders') || []);
   const [expandedOrderId, setExpandedOrderId] = useState(null);
-  const [activeRouteOrder, setActiveRouteOrder] = useState(null);
-  const [settings, setSettings] = useState({ exchange_rate_ves: 36.5 });
-  const [deliveryStats, setDeliveryStats] = useState(null);
-  const [dataPeriod, setDataPeriod] = useState('week');
-  const [geoPermissionGranted, setGeoPermissionGranted] = useState(() => {
-    return localStorage.getItem('lubos_geo_permission') === 'granted';
-  });
-  const watchIdRef = useRef(null);
-  const lastCoordsRef = useRef(null);
-  const lastSentRef = useRef(0);
+  const [settings, setSettings] = useState(() => getLocalCache('settings') || { exchange_rate_ves: 36.5 });
 
-  const sendLocation = useCallback(async (lat, lng) => {
-    const now = Date.now();
-    if (now - lastSentRef.current < 12000) return; // rate limit ~12s
-    lastSentRef.current = now;
-    try { await api.post('/delivery/location', { lat, lng }); }
-    catch { /* ignore */ }
+  const [deliveryLocations, setDeliveryLocations] = useState(() => getLocalCache('delivery_locations') || []);
+  const [isGpsActive, setIsGpsActive] = useState(false);
+
+  // Optimistic override lock to prevent polling / SSE race condition flickering
+  const pendingOptimisticOrdersRef = useRef(new Map());
+
+  const applyOptimisticOrderUpdate = useCallback((orderId, patch) => {
+    pendingOptimisticOrdersRef.current.set(orderId, { patch, timestamp: Date.now() });
+    setOrders(prev => (Array.isArray(prev) ? prev : []).map(o => o.id === orderId ? { ...o, ...patch } : o));
   }, []);
 
-  const requestAndStartLocationTracking = useCallback(() => {
-    if (!('geolocation' in navigator)) {
-      toast.error('Geolocalización no soportada en este navegador');
-      return;
-    }
-    localStorage.setItem('lubos_geo_permission', 'granted');
-    setGeoPermissionGranted(true);
-
-    if (watchIdRef.current !== null) return;
-
-    try {
-      watchIdRef.current = navigator.geolocation.watchPosition(
-        (pos) => {
-          const { latitude, longitude } = pos.coords;
-          lastCoordsRef.current = { lat: latitude, lng: longitude };
-          sendLocation(latitude, longitude);
-        },
-        (err) => { console.warn('[Delivery] geolocation error:', err?.message || err); },
-        { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 }
-      );
-      toast.success('Ubicación guardada y activa para el delivery');
-    } catch (e) { console.warn('[Delivery] watchPosition failed:', e); }
-  }, [sendLocation]);
+  const clearOptimisticOrderUpdate = useCallback((orderId) => {
+    pendingOptimisticOrdersRef.current.delete(orderId);
+  }, []);
+  const [deliveryStats, setDeliveryStats] = useState(null);
+  const [dataPeriod, setDataPeriod] = useState('week');
   const { unreadCount } = useNotifications();
   const userName = user?.name || (() => {
     try { return JSON.parse(localStorage.getItem('user') || '{}').name || ''; } catch { return ''; }
@@ -98,29 +74,46 @@ export default function DeliveryDashboard() {
   };
 
   const loadFast = useCallback(async () => {
-    // Instant cache read
-    const cMyOrders = getLocalCache('delivery_my_orders');
-    if (cMyOrders) setOrders(cMyOrders);
-    const cAvailOrders = getLocalCache('delivery_avail_orders');
-    if (cAvailOrders) setAvailableOrders(cAvailOrders);
-
     try {
-      const [o, av] = await Promise.all([
+      const [o, av, dloc] = await Promise.all([
         api.get('/orders'),
         api.get('/orders/available').catch(() => ({ data: [] })),
+        api.get('/delivery/locations').catch(() => ({ data: [] })),
       ]);
-      setOrders(o.data); setLocalCache('delivery_my_orders', o.data);
-      setAvailableOrders(av.data); setLocalCache('delivery_avail_orders', av.data);
+
+      const now = Date.now();
+      const rawOrders = o.data || [];
+      const mergedOrders = rawOrders.map(ord => {
+        const pending = pendingOptimisticOrdersRef.current.get(ord.id);
+        if (pending && !pending.deleted && now - pending.timestamp < 5000) {
+          return { ...ord, ...pending.patch };
+        }
+        return ord;
+      });
+
+      for (const [id, value] of pendingOptimisticOrdersRef.current.entries()) {
+        if (now - value.timestamp >= 5000) {
+          pendingOptimisticOrdersRef.current.delete(id);
+        }
+      }
+
+      setOrders(mergedOrders);
+      setLocalCache('delivery_my_orders', mergedOrders);
+      setAvailableOrders(av.data || []);
+      setLocalCache('delivery_avail_orders', av.data || []);
+      if (Array.isArray(dloc.data)) {
+        setDeliveryLocations(dloc.data);
+        setLocalCache('delivery_locations', dloc.data);
+      }
     } catch (e) { console.warn('[Delivery] fast fetch failed:', e?.message || e); }
   }, []);
 
   const loadSettings = useCallback(async () => {
-    const cSettings = getLocalCache('settings');
-    if (cSettings) setSettings(cSettings);
     try {
       const { data } = await api.get('/settings');
       setSettings(data);
       setLocalCache('settings', data);
+      syncCentralPointWithBackend(data);
     } catch (e) { console.warn('[Delivery] settings fetch failed:', e?.message || e); }
   }, []);
 
@@ -142,68 +135,53 @@ export default function DeliveryDashboard() {
     const onVisible = () => { if (document.visibilityState === 'visible') refresh(); };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', refresh);
-    // Refresco instantaneo cuando llegan notificaciones de pedidos.
-    window.addEventListener('lubos:orders-changed', refresh);
+    // Refresco instantaneo cuando llegan notificaciones de pedidos o pings de Traccar.
+    const onOrdersSync = () => { refresh(); };
+    const onLocationUpdate = (e) => {
+      const payload = e.detail;
+      if (!payload || typeof payload.lat !== 'number' || typeof payload.lng !== 'number') return;
+      const driverId = String(payload.driver_id || payload.delivery_id);
+      setDeliveryLocations(prevLocations => {
+        const list = Array.isArray(prevLocations) ? prevLocations : [];
+        const existing = list.find(d => String(d.delivery_id) === driverId);
+        const filtered = list.filter(d => String(d.delivery_id) !== driverId);
+        return [...filtered, {
+          delivery_id: driverId,
+          name: payload.name || 'Repartidor',
+          lat: payload.lat,
+          lng: payload.lng,
+          color: payload.color !== undefined ? payload.color : (existing ? existing.color : null),
+          photo_url: payload.photo_url !== undefined ? payload.photo_url : (existing ? existing.photo_url : null),
+          updated_at: payload.updated_at || new Date().toISOString(),
+        }];
+      });
+    };
+
+    window.addEventListener('lubos:orders-changed', onOrdersSync);
+    window.addEventListener('lubos:location_update', onLocationUpdate);
     return () => {
       clearInterval(interval);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', refresh);
-      window.removeEventListener('lubos:orders-changed', refresh);
+      window.removeEventListener('lubos:orders-changed', onOrdersSync);
+      window.removeEventListener('lubos:location_update', onLocationUpdate);
     };
   }, [loadFast, loadDeliveryStats, loadSettings]);
 
-  // Comparte ubicación de forma transparente si el permiso ya fue concedido previamente y guardado.
-  useEffect(() => {
-    if (!('geolocation' in navigator)) return;
-
-    const savedPerm = localStorage.getItem('lubos_geo_permission');
-    if (savedPerm === 'granted') {
-      requestAndStartLocationTracking();
-    } else if (navigator.permissions && navigator.permissions.query) {
-      navigator.permissions.query({ name: 'geolocation' }).then((res) => {
-        if (res.state === 'granted') {
-          requestAndStartLocationTracking();
-        }
-      }).catch(() => {});
-    }
-
-    // Fuerza reenvío de posición al volver a primer plano
-    const onVisible = () => {
-      if (document.visibilityState === 'visible' && lastCoordsRef.current) {
-        lastSentRef.current = 0;
-        sendLocation(lastCoordsRef.current.lat, lastCoordsRef.current.lng);
-      }
-    };
-    document.addEventListener('visibilitychange', onVisible);
-
-    // Re-envía las últimas coordenadas conocidas en segundo plano sin forzar re-solicitud al sistema operativo
-    const interval = setInterval(() => {
-      if (lastCoordsRef.current) {
-        sendLocation(lastCoordsRef.current.lat, lastCoordsRef.current.lng);
-      }
-    }, 15000);
-
-    return () => {
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-        watchIdRef.current = null;
-      }
-      document.removeEventListener('visibilitychange', onVisible);
-      clearInterval(interval);
-    };
-  }, [requestAndStartLocationTracking, sendLocation]);
 
   const updateStatus = async (orderId, status) => {
     const prevOrder = (Array.isArray(orders) ? orders : []).find(o => o.id === orderId);
     
     // 0ms Optimistic UI update
-    setOrders(prev => (Array.isArray(prev) ? prev : []).map(o => o.id === orderId ? { ...o, status, delivered_at: status === 'entregado' ? new Date().toISOString() : o.delivered_at } : o));
-    notifyLocalChange('orders_changed');
+    const patch = { status, delivered_at: status === 'entregado' ? new Date().toISOString() : prevOrder?.delivered_at };
+    applyOptimisticOrderUpdate(orderId, patch);
+    notifyLocalChange('orders_changed', { self: true });
     toast.success(status === 'entregado' ? 'Pedido entregado!' : status === 'pendiente' ? 'Pedido revertido' : 'En camino!');
 
     try {
       await api.patch(`/orders/${orderId}/status`, { status });
     } catch (err) {
+      clearOptimisticOrderUpdate(orderId);
       if (prevOrder) setOrders(prev => (Array.isArray(prev) ? prev : []).map(o => o.id === orderId ? prevOrder : o));
       toast.error(err.response?.data?.detail || 'Error actualizando estado');
     }
@@ -213,10 +191,6 @@ export default function DeliveryDashboard() {
   const rate = settings.exchange_rate_ves || 36.5;
   
   const safeOrders = Array.isArray(orders) ? orders : [];
-  const currentRouteOrder = useMemo(() => {
-    if (!activeRouteOrder) return null;
-    return safeOrders.find(o => o.id === activeRouteOrder.id) || activeRouteOrder;
-  }, [activeRouteOrder, safeOrders]);
   const activeOrders = safeOrders.filter(o => o.status !== 'entregado' && o.status !== 'cancelado');
   // Expone si el delivery esta LIBRE (sin pedidos activos en Mis Pedidos) para que
   // useNotifications decida que sonido tocar cuando llega uno disponible.
@@ -317,12 +291,15 @@ export default function DeliveryDashboard() {
   const releaseOrder = async (orderId) => {
     const targetOrder = (Array.isArray(orders) ? orders : []).find(o => o.id === orderId);
 
-    // 0ms Optimistic UI update: move from orders -> availableOrders
+    // 0ms Optimistic UI update: move from orders -> availableOrders (with status resetting to pendiente)
     setOrders(prev => (Array.isArray(prev) ? prev : []).filter(o => o.id !== orderId));
     if (targetOrder) {
-      setAvailableOrders(prev => [...(Array.isArray(prev) ? prev : []), { ...targetOrder, delivery_id: null, delivery_name: null }]);
+      setAvailableOrders(prev => [
+        ...(Array.isArray(prev) ? prev : []).filter(o => o.id !== orderId),
+        { ...targetOrder, delivery_id: null, delivery_name: null, status: 'pendiente' }
+      ]);
     }
-    notifyLocalChange('orders_changed');
+    notifyLocalChange('orders_changed', { self: true });
     toast.success('Pedido devuelto a Disponibles');
 
     try {
@@ -342,11 +319,11 @@ export default function DeliveryDashboard() {
       return;
     }
 
-    // 0ms Optimistic UI update: move from availableOrders -> orders
+    // 0ms Optimistic UI update: move from availableOrders -> orders keeping status (pendiente)
     setAvailableOrders(prev => (Array.isArray(prev) ? prev : []).filter(o => o.id !== order.id));
-    setOrders(prev => [...(Array.isArray(prev) ? prev : []), { ...order, delivery_id: user?.id, delivery_name: user?.name || 'Delivery' }]);
-    notifyLocalChange('orders_changed');
-    toast.success('Pedido tomado. Toca "Salir a Entregar" para avisarle al cliente.');
+    setOrders(prev => [...(Array.isArray(prev) ? prev : []), { ...order, status: order.status || 'pendiente', delivery_id: user?.id, delivery_name: user?.name || 'Delivery' }]);
+    notifyLocalChange('orders_changed', { self: true });
+    toast.success('Pedido tomado');
 
     try {
       await api.post(`/orders/${order.id}/take`);
@@ -451,30 +428,6 @@ export default function DeliveryDashboard() {
         </div>
       </div>
 
-      {/* Banner de Permiso de Ubicación (Solo si no se ha concedido aún) */}
-      {!geoPermissionGranted && (
-        <div className="bg-amber-50 border border-amber-200/80 rounded-2xl p-3 px-4 flex items-center justify-between gap-3 shadow-xs" data-testid="geo-permission-banner">
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="w-9 h-9 rounded-full bg-amber-100 text-amber-800 flex items-center justify-center shrink-0">
-              <Navigation className="h-4 w-4" />
-            </div>
-            <div className="min-w-0">
-              <p className="text-xs font-bold text-[#501122]">Permitir compartir ubicación</p>
-              <p className="text-[11px] text-[#78686C] truncate">Actívalo 1 sola vez para que los clientes y el panel puedan ver tu ruta en tiempo real.</p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={requestAndStartLocationTracking}
-            className="shrink-0 px-4 py-2 rounded-full bg-[#501122] hover:bg-[#3D0C19] text-white text-xs font-bold active:scale-95 transition-all shadow-sm flex items-center gap-1.5"
-            data-testid="enable-gps-btn"
-          >
-            <Navigation className="h-3.5 w-3.5" />
-            <span>Activar GPS</span>
-          </button>
-        </div>
-      )}
-
       {/* DISPONIBLES - simplified: name + location + take button */}
       {activeSection === 'disponibles' && (
         <div className="space-y-3">
@@ -485,8 +438,10 @@ export default function DeliveryDashboard() {
             subtitle="Pedidos sin asignar (solo hoy). Util para agruparlos por zona y entregarlos juntos."
             testId="delivery-disponibles-map"
             hideFutureDays={true}
-            centralPoint={settings.central_point_lat && settings.central_point_lng ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : null}
+            centralPoint={(settings.central_point_lat && settings.central_point_lng) ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : getStoredCentralPoint()}
             expandHref="/map-view?scope=delivery-available"
+            deliveryLocations={deliveryLocations}
+            showRoute={true}
           />
           {availableOrders.length === 0 ? (
             <div className="bg-white rounded-[1.5rem] border border-[#501122]/10 p-10 text-center" data-testid="no-available">
@@ -514,6 +469,18 @@ export default function DeliveryDashboard() {
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0 flex-1">
                           <p className="font-bold text-[#501122] text-lg min-w-0 truncate">{order.customer_name}</p>
+                          {order.items && order.items.length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-1.5" data-testid={`avail-items-${order.id}`}>
+                              {order.items.map((it, idx) => (
+                                <div key={it.id || idx} className="flex items-center gap-1.5 bg-[#F3EBE0] rounded-full pl-1 pr-2.5 py-0.5 border border-[#501122]/10">
+                                  <div className="w-5 h-5 rounded-full bg-[#501122] flex items-center justify-center text-white text-[10px] font-bold shrink-0">
+                                    {it.quantity}
+                                  </div>
+                                  <span className="text-xs font-semibold text-[#501122]">{it.flavor_name || it.name}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           {isWaitForNotice && (
                             <p className="text-[11px] font-bold text-amber-800 uppercase tracking-wider flex items-center gap-1 mt-0.5" data-testid={`available-wait-notice-${order.id}`}>
                               <Hourglass className="h-3.5 w-3.5 shrink-0 text-amber-700" />
@@ -611,8 +578,10 @@ export default function DeliveryDashboard() {
             title="Mapa de Mis Pedidos"
             subtitle="Pedidos que tienes tomados (pendientes y en camino)."
             testId="delivery-mine-map"
-            centralPoint={settings.central_point_lat && settings.central_point_lng ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : null}
+            centralPoint={(settings.central_point_lat && settings.central_point_lng) ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : getStoredCentralPoint()}
             expandHref="/map-view?scope=delivery-mine"
+            deliveryLocations={deliveryLocations}
+            showRoute={true}
           />
 
           {/* Active Orders */}
@@ -626,130 +595,210 @@ export default function DeliveryDashboard() {
             <div className="grid grid-cols-1 [@media(orientation:landscape)_and_(max-height:500px)]:grid-cols-2 sm:grid-cols-2 lg:grid-cols-2 gap-4">
               {sortedActiveOrders.map(order => {
                 const itemsSummary = order.items?.map(i => `${i.quantity}x ${i.flavor_name}`).join(', ') || '';
-                const phoneDigits = (order.customer_phone || '').replace(/[^0-9]/g, '');
                 const mapsHref = buildMapsHref(order);
                 const sched = getScheduleInfo(order);
                 const locked = sched?.kind === 'future';
+
+                // Target phone logic: prefer recipient phone if specified, otherwise customer phone
+                const targetPhone = order.receiver_phone || order.customer_phone || '';
+                const phoneDigits = targetPhone.replace(/[^0-9]/g, '');
+
                 return (
-                <div key={order.id} className={`bg-white rounded-[1.5rem] border border-[#501122]/10 shadow-[0_8px_30px_rgba(80,17,34,0.03)] overflow-hidden transition-all duration-300 hover:-translate-y-0.5 ${locked ? 'opacity-50 pointer-events-none' : ''}`} data-testid={`delivery-order-${order.id}`}>
-                  {/* Card Header */}
-                  <div className="w-full p-4 flex justify-between items-start gap-3 text-left">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-mono text-[#78686C] block">{order.order_number}</span>
-                      </div>
-                      <p className="font-heading text-lg text-[#501122] truncate">{order.customer_name}</p>
-                      {order.wait_for_notice && (
-                        <p className="text-[11px] font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1 mt-0.5" data-testid={`delivery-order-wait-notice-${order.id}`}>
-                          <Hourglass className="h-3 w-3 shrink-0 text-gray-500" />
-                          esperar aviso
-                        </p>
-                      )}
-                      <p className="text-xs text-[#78686C] truncate" title={itemsSummary}>{itemsSummary}</p>
-                      {sched && (
-                        <p className={`text-[11px] font-semibold flex items-center gap-1 mt-1 ${locked ? 'text-[#78686C]' : 'text-[#C27A29]'}`} data-testid={`schedule-badge-${order.id}`}>
-                          <Clock className="h-3 w-3" />{sched.label}
-                        </p>
-                      )}
-                    </div>
-
-                    <div className="flex flex-col items-end gap-1.5 shrink-0">
-                      <div className="flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            releaseOrder(order.id);
-                          }}
-                          title="Devolver pedido a Disponibles"
-                          data-testid={`release-order-btn-${order.id}`}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-amber-500/10 hover:bg-amber-500/20 text-amber-800 border border-amber-500/30 text-xs font-bold transition-all active:scale-95"
-                        >
-                          <Undo2 className="h-3.5 w-3.5" />
-                          <span className="text-[10px] hidden sm:inline">Devolver</span>
-                        </button>
-                        <span className="inline-flex items-center gap-0.5 px-2.5 py-0.5 rounded-full bg-[#3F634A]/10 text-[#3F634A] border border-[#3F634A]/20 text-xs font-extrabold font-mono" title="Ganancia del delivery">
-                          {formatUSD(order.delivery_fee || 0)}
-                        </span>
-                      </div>
-                      {locked
-                        ? <Badge className="bg-[#78686C] text-white rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0">Bloqueado</Badge>
-                        : <Badge className={`${statusColors[order.status]} rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0`}>{statusLabels[order.status]}</Badge>}
-                    </div>
-                  </div>
-
-                  {/* Meta chips (notas y receptor alterno) */}
-                  {(order.notes || order.receiver_name || order.receiver_phone) && (
-                    <div className="px-4 pb-3 space-y-2" data-testid={`always-meta-${order.id}`}>
-                      {order.notes && (
-                        <div className="bg-[#C27A29]/10 border border-[#C27A29]/20 rounded-xl px-3 py-1.5" data-testid={`mine-notes-${order.id}`}>
-                          <p className="text-xs text-[#C27A29] leading-snug"><span className="font-bold">Nota:</span> {order.notes}</p>
-                        </div>
-                      )}
-                      {(order.receiver_name || order.receiver_phone) && (
-                        <div className="bg-[#501122]/5 border border-[#501122]/15 rounded-xl px-3 py-1.5 flex items-center justify-between gap-2" data-testid={`mine-receiver-${order.id}`}>
-                          <p className="text-xs text-[#501122] leading-snug min-w-0">
-                            <span className="font-bold">Recibe otra persona:</span>{' '}
-                            {order.receiver_name || 'Sin nombre'}
-                            {order.receiver_phone ? ` \u00b7 ${order.receiver_phone}` : ''}
-                          </p>
-                          {order.receiver_phone && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                const rDigits = (order.receiver_phone || '').replace(/[^0-9]/g, '');
-                                const g = (order.customer_gender || '').toUpperCase();
-                                const treat = (g === 'F' || g === 'MUJER') ? ' querida' : ((g === 'M' || g === 'HOMBRE') ? ' hermano' : '');
-                                const msg = `*Delivery de Lubo's Tiramisu*\nPedido de ${order.customer_name || ''}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicación para que estes pendiente🤎`;
-                                window.open(`https://wa.me/${rDigits}?text=${encodeURIComponent(msg)}`, '_blank');
-                              }}
-                              data-testid={`mine-receiver-wa-${order.id}`}
-                              className="shrink-0 flex items-center gap-1 h-7 px-2.5 rounded-full bg-[#25D366] hover:bg-[#20BF5B] text-white text-[10px] font-semibold shadow-sm active:scale-95 transition-all"
-                              title="Enviar WhatsApp al que recibe"
-                            >
-                              <MessageCircle className="h-3 w-3" />WhatsApp
-                            </button>
+                <div key={order.id} className={`bg-white rounded-[1.5rem] border border-[#501122]/10 shadow-[0_8px_30px_rgba(80,17,34,0.03)] overflow-hidden flex flex-col justify-between transition-all duration-300 ${locked ? 'opacity-50 pointer-events-none' : ''}`} data-testid={`delivery-order-${order.id}`}>
+                  <div className="p-4 space-y-3.5">
+                    {/* Card Header */}
+                    <div className="flex justify-between items-start gap-3 text-left">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-mono text-[#78686C] block">{order.order_number}</span>
+                          {order.wait_for_notice && (
+                            <span className="text-[10px] font-bold text-amber-800 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded-full flex items-center gap-1">
+                              <Hourglass className="h-3 w-3 shrink-0" /> Esperar aviso
+                            </span>
                           )}
                         </div>
-                      )}
+                        <p className="font-heading text-xl text-[#501122] font-extrabold truncate">{order.customer_name}</p>
+                        {order.items && order.items.length > 0 ? (
+                          <div className="mt-2 flex flex-wrap gap-1.5" data-testid={`mine-items-${order.id}`}>
+                            {order.items.map((it, idx) => (
+                              <div key={it.id || idx} className="flex items-center gap-1.5 bg-[#F3EBE0] rounded-full pl-1 pr-2.5 py-0.5 border border-[#501122]/10">
+                                <div className="w-5 h-5 rounded-full bg-[#501122] flex items-center justify-center text-white text-[10px] font-bold shrink-0">
+                                  {it.quantity}
+                                </div>
+                                <span className="text-xs font-semibold text-[#501122]">{it.flavor_name || it.name}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : itemsSummary ? (
+                          <p className="text-xs text-[#78686C] truncate mt-0.5" title={itemsSummary}>{itemsSummary}</p>
+                        ) : null}
+
+                        {sched && (
+                          <p className={`text-[11px] font-semibold flex items-center gap-1 mt-1 ${locked ? 'text-[#78686C]' : 'text-[#C27A29]'}`} data-testid={`schedule-badge-${order.id}`}>
+                            <Clock className="h-3 w-3" />{sched.label}
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="flex flex-col items-end gap-1.5 shrink-0">
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              releaseOrder(order.id);
+                            }}
+                            title="Devolver pedido a Disponibles"
+                            data-testid={`release-order-btn-${order.id}`}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-500/10 hover:bg-amber-500/20 text-amber-800 border border-amber-500/30 text-xs font-bold transition-all active:scale-95"
+                          >
+                            <Undo2 className="h-3.5 w-3.5" />
+                            <span className="text-[10px] hidden sm:inline">Devolver</span>
+                          </button>
+                          <span className="inline-flex items-center gap-0.5 px-2.5 py-1 rounded-full bg-[#3F634A]/10 text-[#3F634A] border border-[#3F634A]/20 text-xs font-extrabold font-mono" title="Ganancia del delivery">
+                            {formatUSD(order.delivery_fee || 0)}
+                          </span>
+                        </div>
+                        {locked
+                          ? <Badge className="bg-[#78686C] text-white rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0">Bloqueado</Badge>
+                          : <Badge className={`${statusColors[order.status]} rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border-0`}>{statusLabels[order.status]}</Badge>}
+                      </div>
                     </div>
-                  )}
 
-                  {/* Split 2-part Action Bar (Flush at bottom of card) */}
-                  <div className="border-t border-[#501122]/10 flex w-full divide-x divide-white/20 text-xs font-bold">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const targetPhone = order.receiver_phone || order.customer_phone || '';
-                        const pDigits = targetPhone.replace(/[^0-9]/g, '');
-                        const g = (order.customer_gender || '').toUpperCase();
-                        const treat = (g === 'F' || g === 'MUJER') ? ' querida' : ((g === 'M' || g === 'HOMBRE') ? ' hermano' : '');
-                        const msg = `*Delivery de Lubo's Tiramisu*\nPedido de ${order.customer_name || ''}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicación para que estes pendiente🤎`;
-                        window.open(`https://wa.me/${pDigits}?text=${encodeURIComponent(msg)}`, '_blank');
-                      }}
-                      data-testid={`notify-client-btn-${order.id}`}
-                      className="flex-1 flex items-center justify-center gap-1.5 h-11 bg-[#25D366] hover:bg-[#20BF5B] text-white active:opacity-90 transition-all px-2"
-                    >
-                      <MessageCircle className="h-3.5 w-3.5 shrink-0" />
-                      <span className="truncate">Avisar al cliente</span>
-                    </button>
+                    {/* Notes & Recipient Meta Banners */}
+                    {(order.notes || order.receiver_name || order.receiver_phone) && (
+                      <div className="space-y-2" data-testid={`always-meta-${order.id}`}>
+                        {order.notes && (
+                          <div className="bg-[#C27A29]/10 border border-[#C27A29]/20 rounded-xl px-3 py-2" data-testid={`mine-notes-${order.id}`}>
+                            <p className="text-xs text-[#C27A29] leading-snug"><span className="font-bold">Nota:</span> {order.notes}</p>
+                          </div>
+                        )}
+                        {(order.receiver_name || order.receiver_phone) && (
+                          <div className="bg-[#501122]/5 border border-[#501122]/15 rounded-xl px-3 py-2 flex items-center justify-between gap-2" data-testid={`mine-receiver-${order.id}`}>
+                            <div className="min-w-0">
+                              <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#501122] block">Recibe otra persona:</span>
+                              <p className="text-xs font-bold text-[#1F1517] truncate">
+                                {order.receiver_name || 'Sin nombre'} {order.receiver_phone ? `\u00b7 ${order.receiver_phone}` : ''}
+                              </p>
+                            </div>
+                            <span className="text-[10px] font-semibold text-[#501122] bg-[#501122]/10 px-2.5 py-0.5 rounded-full shrink-0">
+                              Receptor activo
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
 
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        if (order.status === 'pendiente') {
-                          await updateStatus(order.id, 'en_camino');
-                        }
-                        setActiveRouteOrder(order);
-                      }}
-                      data-testid={`start-route-btn-${order.id}`}
-                      className="flex-1 flex items-center justify-center gap-1.5 h-11 bg-[#501122] hover:bg-[#3D0C19] text-white active:opacity-90 transition-all px-2"
-                    >
-                      <Navigation className="h-3.5 w-3.5 shrink-0 fill-current" />
-                      <span className="truncate">{order.status === 'en_camino' ? 'Ver ruta' : 'Comenzar ruta'}</span>
-                    </button>
+                    {/* 4 Circular Icon Buttons Row */}
+                    <div className="flex items-center justify-around gap-2 pt-1">
+                      {/* 1. Botón En Camino */}
+                      <div className="flex flex-col items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            if (order.status === 'pendiente') {
+                              await updateStatus(order.id, 'en_camino');
+                            }
+                            let msg = '';
+                            if (order.receiver_phone) {
+                              msg = `*Delivery de Lubo's Tiramisu*\nPedido para ${order.customer_name || ''}\n\nHola, un gusto, es ${userName}. Ya voy en camino a su ubicación para entregar el pedido para que estes pendiente🤎`;
+                            } else {
+                              const g = (order.customer_gender || '').toUpperCase();
+                              const treat = (g === 'F' || g === 'MUJER') ? ' querida' : ((g === 'M' || g === 'HOMBRE') ? ' hermano' : '');
+                              msg = `*Delivery de Lubo's Tiramisu*\nPedido de ${order.customer_name || ''}\n\nHola${treat}, un gusto, es ${userName}. Ya voy en camino a su ubicación para que estes pendiente🤎`;
+                            }
+                            window.open(`https://wa.me/${phoneDigits}?text=${encodeURIComponent(msg)}`, '_blank');
+                          }}
+                          title="Avisar que voy en camino por WhatsApp"
+                          data-testid={`btn-en-camino-${order.id}`}
+                          className="w-12 h-12 rounded-full bg-[#25D366] hover:bg-[#20BF5B] text-white flex items-center justify-center shadow-md active:scale-90 transition-all"
+                        >
+                          <Truck className="h-5 w-5" />
+                        </button>
+                        <span className="text-[10px] font-bold text-[#78686C] text-center leading-tight">En camino</span>
+                      </div>
+
+                      {/* 2. Botón Ver Ruta en Google Maps */}
+                      <div className="flex flex-col items-center gap-1">
+                        <a
+                          href={mapsHref}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={async () => {
+                            if (order.status === 'pendiente') {
+                              await updateStatus(order.id, 'en_camino');
+                            }
+                          }}
+                          title="Ver ruta en Google Maps"
+                          data-testid={`btn-ver-ruta-${order.id}`}
+                          className="w-12 h-12 rounded-full bg-[#4285F4] hover:bg-[#3367D6] text-white flex items-center justify-center shadow-md active:scale-90 transition-all"
+                        >
+                          <Navigation className="h-5 w-5 fill-current" />
+                        </a>
+                        <span className="text-[10px] font-bold text-[#78686C] text-center leading-tight">Ver ruta</span>
+                      </div>
+
+                      {/* 3. Botón Llamar */}
+                      <div className="flex flex-col items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => callCustomer(targetPhone)}
+                          title={`Llamar a ${order.receiver_phone ? order.receiver_name || 'receptor' : order.customer_name}`}
+                          data-testid={`btn-llamar-${order.id}`}
+                          className="w-12 h-12 rounded-full bg-[#501122] hover:bg-[#3D0C19] text-white flex items-center justify-center shadow-md active:scale-90 transition-all"
+                        >
+                          <Phone className="h-5 w-5" />
+                        </button>
+                        <span className="text-[10px] font-bold text-[#78686C] text-center leading-tight">Llamar</span>
+                      </div>
+
+                      {/* 4. Botón Avisar Ya Estoy en Ubicación */}
+                      <div className="flex flex-col items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            let msg = '';
+                            if (order.receiver_phone) {
+                              msg = `*Delivery de Lubo's Tiramisu*\n\nHola, ya estoy acá en la ubicación con el pedido de ${order.customer_name || ''}🤎`;
+                            } else {
+                              msg = `Listo, ya estoy acá en la ubicación🤎`;
+                            }
+                            window.open(`https://wa.me/${phoneDigits}?text=${encodeURIComponent(msg)}`, '_blank');
+                          }}
+                          title="Avisar por WhatsApp que ya estoy en la ubicación"
+                          data-testid={`btn-ya-llegue-${order.id}`}
+                          className="w-12 h-12 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white flex items-center justify-center shadow-md active:scale-90 transition-all"
+                        >
+                          <MessageCircle className="h-5 w-5" />
+                        </button>
+                        <span className="text-[10px] font-bold text-[#78686C] text-center leading-tight">Ya llegué</span>
+                      </div>
+                    </div>
                   </div>
+
+                  {/* Button Entregado Flush at Bottom */}
+                  {order.status === 'en_camino' ? (
+                    <button
+                      type="button"
+                      onClick={() => updateStatus(order.id, 'entregado')}
+                      data-testid={`deliver-order-btn-${order.id}`}
+                      className="w-full flex items-center justify-center gap-2 h-12 bg-[#3F634A] hover:bg-[#2E4A37] text-white text-sm font-extrabold uppercase tracking-wider active:opacity-90 transition-all cursor-pointer"
+                    >
+                      <Check className="h-5 w-5 stroke-[3]" />
+                      <span>Entregado</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled
+                      title="Avisa al cliente tocando 'En camino' para habilitar"
+                      data-testid={`deliver-order-btn-disabled-${order.id}`}
+                      className="w-full flex items-center justify-center gap-2 h-12 bg-gray-200 text-gray-400 text-sm font-bold uppercase tracking-wider cursor-not-allowed border-t border-gray-200 transition-all select-none"
+                    >
+                      <Check className="h-5 w-5 stroke-[2] text-gray-400" />
+                      <span>Entregado</span>
+                    </button>
+                  )}
                 </div>
                 );
               })}
@@ -1023,154 +1072,6 @@ export default function DeliveryDashboard() {
           )}
         </button>
       </div>
-
-      {/* Full-Screen Route Navigation View */}
-      {currentRouteOrder && (
-        <div className="fixed inset-0 z-50 bg-[#FBF7F0] flex flex-col overflow-hidden animate-in fade-in duration-200" data-testid="route-navigation-modal">
-          {/* Compact Top Header Floating Card */}
-          <div className="absolute top-2.5 left-2.5 right-2.5 [@media(orientation:landscape)_and_(max-height:500px)]:right-auto [@media(orientation:landscape)_and_(max-height:500px)]:w-[300px] z-30 bg-white/95 backdrop-blur-md border border-[#501122]/15 shadow-xl rounded-2xl p-2.5 px-3 flex items-center justify-between gap-2.5">
-
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5 flex-wrap">
-                <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#501122]/10 text-[#501122]">
-                  {currentRouteOrder.order_number}
-                </span>
-                <Badge className={`${statusColors[currentRouteOrder.status] || 'bg-blue-100 text-blue-700'} rounded-full px-2 py-0.2 text-[9px] font-bold uppercase border-0`}>
-                  {statusLabels[currentRouteOrder.status] || currentRouteOrder.status}
-                </Badge>
-              </div>
-              <p className="font-heading text-sm font-bold text-[#501122] truncate mt-0.5">
-                {currentRouteOrder.customer_name}
-              </p>
-              <p className="text-[11px] text-[#78686C] truncate flex items-center gap-1">
-                <MapPin className="h-3 w-3 shrink-0 text-[#4285F4]" />
-                {currentRouteOrder.delivery_address || (currentRouteOrder.lat && currentRouteOrder.lng ? `${currentRouteOrder.lat.toFixed(4)}, ${currentRouteOrder.lng.toFixed(4)}` : 'Ubicación seleccionada')}
-              </p>
-            </div>
-
-            {/* Top Right Action: GPS External & Exit "X" */}
-            <div className="flex items-center gap-1.5 shrink-0">
-              {buildMapsHref(currentRouteOrder) && (
-                <a
-                  href={buildMapsHref(currentRouteOrder)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="h-9 w-9 flex items-center justify-center rounded-xl bg-[#4285F4] hover:bg-[#3367D6] text-white active:scale-95 transition-all shadow-sm"
-                  title="Abrir en Waze / Google Maps"
-                >
-                  <ExternalLink className="h-4 w-4" />
-                </a>
-              )}
-              <button
-                type="button"
-                onClick={() => setActiveRouteOrder(null)}
-                data-testid="close-route-modal-btn"
-                className="h-9 w-9 flex items-center justify-center rounded-xl bg-gray-100 hover:bg-gray-200 text-[#501122] active:scale-95 transition-all shadow-sm"
-                title="Salir de la ruta"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-          </div>
-
-          {/* Full Screen Navigation Map Area (extends behind top floating banner) */}
-          <div className="absolute inset-0 z-10 w-full h-full">
-            <DeliveryNavigationMap
-              order={currentRouteOrder}
-              centralPoint={settings.central_point_lat && settings.central_point_lng ? { lat: settings.central_point_lat, lng: settings.central_point_lng } : null}
-              testId="route-modal-navigation-map"
-            />
-          </div>
-
-          {/* Compact Bottom Overlay Area (Banners & Action Controls) */}
-          <div className="mt-auto relative z-30 bg-white border-t border-[#501122]/15 shadow-[0_-8px_30px_rgba(80,17,34,0.15)] rounded-t-2xl overflow-hidden max-h-[50vh] [@media(orientation:landscape)_and_(max-height:500px)]:mt-0 [@media(orientation:landscape)_and_(max-height:500px)]:absolute [@media(orientation:landscape)_and_(max-height:500px)]:top-auto [@media(orientation:landscape)_and_(max-height:500px)]:left-2.5 [@media(orientation:landscape)_and_(max-height:500px)]:bottom-2.5 [@media(orientation:landscape)_and_(max-height:500px)]:w-[300px] [@media(orientation:landscape)_and_(max-height:500px)]:max-h-[calc(100vh-96px)] [@media(orientation:landscape)_and_(max-height:500px)]:rounded-2xl [@media(orientation:landscape)_and_(max-height:500px)]:border [@media(orientation:landscape)_and_(max-height:500px)]:shadow-xl flex flex-col justify-between">
-            {/* Inner Padding Content Area */}
-            <div className="p-2.5 px-3 space-y-2 overflow-y-auto">
-              {/* Banner 1: Recibe otra persona */}
-              {(currentRouteOrder.receiver_name || currentRouteOrder.receiver_phone) && (
-                <div className="bg-[#501122]/5 border border-[#501122]/15 rounded-xl p-2 px-2.5 flex items-center justify-between gap-2" data-testid="route-modal-receiver-banner">
-                  <div className="min-w-0">
-                    <span className="text-[9px] font-extrabold uppercase tracking-wider text-[#501122] block">Recibe otra persona</span>
-                    <p className="text-xs font-bold text-[#1F1517] truncate">
-                      {currentRouteOrder.receiver_name || 'Sin nombre'} {currentRouteOrder.receiver_phone ? `(${currentRouteOrder.receiver_phone})` : ''}
-                    </p>
-                  </div>
-                  {currentRouteOrder.receiver_phone && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const rDigits = (currentRouteOrder.receiver_phone || '').replace(/[^0-9]/g, '');
-                        const g = (currentRouteOrder.customer_gender || '').toUpperCase();
-                        const treat = (g === 'F' || g === 'MUJER') ? ' querida' : ((g === 'M' || g === 'HOMBRE') ? ' hermano' : '');
-                        const msg = `*Delivery de Lubo's Tiramisu*\nPedido de ${currentRouteOrder.customer_name || ''}\n\nHola${treat}, un gusto, es ${userName}. Ya voy saliendo para su ubicación para que estes pendiente🤎`;
-                        window.open(`https://wa.me/${rDigits}?text=${encodeURIComponent(msg)}`, '_blank');
-                      }}
-                      className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#25D366] text-white text-[11px] font-bold active:scale-95 shadow-sm"
-                    >
-                      <MessageCircle className="h-3.5 w-3.5" /> WhatsApp
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {/* Banner 2: Nota del vendedor */}
-              {currentRouteOrder.notes && (
-                <div className="bg-[#C27A29]/10 border border-[#C27A29]/25 rounded-xl p-2 px-2.5" data-testid="route-modal-notes-banner">
-                  <span className="text-[9px] font-extrabold uppercase tracking-wider text-[#C27A29] block">Nota del vendedor</span>
-                  <p className="text-xs font-medium text-[#1F1517] leading-tight mt-0.5">{currentRouteOrder.notes}</p>
-                </div>
-              )}
-
-              {/* Avisar y Llamar split buttons */}
-              <div className="flex w-full rounded-xl overflow-hidden divide-x divide-white/20 text-xs font-bold shadow-sm border border-[#501122]/10">
-                {/* Button 1: Avisar (Ya llegué) */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    const targetPhone = currentRouteOrder.receiver_phone || currentRouteOrder.customer_phone || '';
-                    const digits = targetPhone.replace(/[^0-9]/g, '');
-                    const msg = `Listo ya estoy acá🤎`;
-                    window.open(`https://wa.me/${digits}?text=${encodeURIComponent(msg)}`, '_blank');
-                  }}
-                  data-testid="route-modal-notify-arrived-btn"
-                  className="flex-1 flex items-center justify-center gap-1.5 h-10 bg-[#25D366] hover:bg-[#20BF5B] text-white active:opacity-90 transition-all px-2"
-                >
-                  <MessageCircle className="h-3.5 w-3.5 shrink-0" />
-                  <span className="truncate">Avisar llegué</span>
-                </button>
-
-                {/* Button 2: Llamar */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    const targetPhone = currentRouteOrder.receiver_phone || currentRouteOrder.customer_phone || '';
-                    callCustomer(targetPhone);
-                  }}
-                  data-testid="route-modal-call-btn"
-                  className="flex-1 flex items-center justify-center gap-1.5 h-10 bg-[#501122] hover:bg-[#3D0C19] text-white active:opacity-90 transition-all px-2"
-                >
-                  <Phone className="h-3.5 w-3.5 shrink-0" />
-                  <span className="truncate">Llamar</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Big "Entregado" Button - Full Width Bar Flush at Bottom */}
-            <button
-              type="button"
-              onClick={async () => {
-                await updateStatus(currentRouteOrder.id, 'entregado');
-                setActiveRouteOrder(null);
-              }}
-              data-testid="route-modal-delivered-btn"
-              className="w-full flex items-center justify-center gap-2 h-12 bg-[#3F634A] hover:bg-[#2E4A37] text-white text-sm font-extrabold uppercase tracking-wider active:opacity-90 transition-all shrink-0 border-t border-[#3F634A]"
-            >
-              <Check className="h-5 w-5 stroke-[3]" />
-              <span>Entregado</span>
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

@@ -39,14 +39,94 @@ import {
   fetchDirectionsPolyline,
 } from './server/geo.js';
 
+import axios from 'axios';
+
+// ── BCV RATE UTILITIES & SCHEDULER (6:00 AM America/Caracas) ──
+export async function fetchLiveBcvRate(): Promise<number | null> {
+  // Attempt 1: Try direct oficial endpoint
+  try {
+    console.log('[BCV UPDATE] Fetching live BCV rate from DolarAPI (oficial)...');
+    const response = await axios.get('https://ve.dolarapi.com/v1/dolares/oficial', { timeout: 10000 });
+    if (response.data) {
+      const val = parseFloat(response.data.promedio || response.data.venta || response.data.compra);
+      if (val && !isNaN(val) && val > 0) {
+        return val;
+      }
+    }
+  } catch (err: any) {
+    console.warn('[BCV UPDATE] Failed to fetch from direct oficial endpoint, trying list endpoint...', err.message || err);
+  }
+
+  // Attempt 2: Backup - Try list endpoint
+  try {
+    const response = await axios.get('https://ve.dolarapi.com/v1/dolares', { timeout: 10000 });
+    if (Array.isArray(response.data)) {
+      const oficialItem = response.data.find((item: any) => 
+        item.fuente === 'oficial' || item.nombre?.toLowerCase().includes('oficial') || item.id === 'oficial'
+      );
+      if (oficialItem) {
+        const val = parseFloat(oficialItem.promedio || oficialItem.venta || oficialItem.compra);
+        if (val && !isNaN(val) && val > 0) {
+          return val;
+        }
+      }
+    }
+  } catch (err: any) {
+    console.error('[BCV UPDATE] All BCV rate fetch attempts failed:', err.message || err);
+  }
+
+  return null;
+}
+
+let lastSuccessfulBcvUpdateDay = '';
+
+async function runBcvUpdateScheduler() {
+  try {
+    const caracasString = new Date().toLocaleString('en-US', { timeZone: 'America/Caracas' });
+    const caracasDate = new Date(caracasString);
+    const caracasDayStr = `${caracasDate.getFullYear()}-${String(caracasDate.getMonth() + 1).padStart(2, '0')}-${String(caracasDate.getDate()).padStart(2, '0')}`;
+    const hour = caracasDate.getHours();
+
+    // If it's 6:00 AM (or later) in Caracas, and we haven't successfully synced for today yet
+    if (hour >= 6 && lastSuccessfulBcvUpdateDay !== caracasDayStr) {
+      console.log(`[BCV SCHEDULER] Triggering automatic daily update for day ${caracasDayStr} (Caracas time)...`);
+      const liveRate = await fetchLiveBcvRate();
+      if (liveRate && liveRate > 0) {
+        await prisma.appSettings.upsert({
+          where: { key: 'app_settings' },
+          update: { exchange_rate_ves: liveRate },
+          create: { key: 'app_settings', exchange_rate_ves: liveRate, delivery_driver_pct: 85.0 }
+        });
+        
+        lastSuccessfulBcvUpdateDay = caracasDayStr;
+        console.log(`[BCV SCHEDULER SUCCESS] Auto-updated exchange_rate_ves to ${liveRate} for ${caracasDayStr}`);
+        broadcastEvent('settings_changed');
+      } else {
+        console.warn(`[BCV SCHEDULER RETRY] Failed to fetch live BCV rate at ${hour}:00, will retry on next check.`);
+      }
+    }
+  } catch (err: any) {
+    console.error('[BCV SCHEDULER ERROR] Failed in scheduler loop:', err);
+  }
+}
+
+// Check every 1 minute
+setInterval(runBcvUpdateScheduler, 60 * 1000);
+
 const app = express();
 const PORT = 3000;
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.text({ type: 'text/plain' }));
 
-// Request logger
+// Request logger and Security headers
 app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+
   if (req.path.startsWith('/api')) {
     console.log(`[API] ${req.method} ${req.path}`);
   }
@@ -131,6 +211,11 @@ app.get('/api/public/team', async (req: Request, res: Response) => {
   }
 });
 
+app.get('/api/public/maps-key', (req: Request, res: Response) => {
+  const key = process.env.GOOGLE_MAPS_KEY || process.env.VITE_GOOGLE_MAPS_KEY || process.env.GOOGLE_MAPS_PLATFORM_KEY || '';
+  res.json({ key });
+});
+
 app.post('/api/auth/login', async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body || {};
@@ -211,7 +296,7 @@ app.get('/api/users/deliveries', requireRoles('admin', 'vendedor'), async (req: 
 
 app.post('/api/users', requireRoles('admin'), async (req: Request, res: Response) => {
   try {
-    const { username, password, name, role } = req.body || {};
+    const { username, password, name, role, color } = req.body || {};
     if (!username || !password || !name) {
       res.status(400).json({ detail: 'Faltan campos requeridos' });
       return;
@@ -228,9 +313,12 @@ app.post('/api/users', requireRoles('admin'), async (req: Request, res: Response
         password_hash: hashPassword(password),
         name,
         role: role || 'vendedor',
+        color: color || null,
       },
     });
-    res.json({ id: newUser.id, username: newUser.username, name: newUser.name, role: newUser.role });
+    const formatted = formatUser(newUser);
+    const { password_hash, ...rest } = formatted;
+    res.json(rest);
   } catch (err: any) {
     console.error('Error creating user:', err);
     res.status(500).json({ detail: 'Error al crear usuario' });
@@ -245,7 +333,7 @@ app.put('/api/users/:user_id', requireRoles('admin'), async (req: Request, res: 
       res.status(404).json({ detail: 'Usuario no encontrado' });
       return;
     }
-    const { name, role, username, password, photo_data_url } = req.body || {};
+    const { name, role, username, password, photo_data_url, color } = req.body || {};
     const updateData: any = {};
 
     if (name !== undefined) updateData.name = name;
@@ -265,6 +353,9 @@ app.put('/api/users/:user_id', requireRoles('admin'), async (req: Request, res: 
     }
     if (photo_data_url !== undefined) {
       updateData.photo_data_url = photo_data_url || null;
+    }
+    if (color !== undefined) {
+      updateData.color = color || null;
     }
 
     const updated = await prisma.user.update({
@@ -310,45 +401,18 @@ function normalizeText(s: string): string {
 app.get('/api/customers', requireRoles('admin', 'vendedor'), async (req: Request, res: Response) => {
   try {
     const q = req.query.q as string;
-    let limit = parseInt((req.query.limit as string) || '25', 10);
+    let limit = parseInt((req.query.limit as string) || '50', 10);
     limit = Math.max(1, Math.min(limit, 100));
 
-    let customers = await prisma.customer.findMany({
-      orderBy: { created_at: 'desc' },
-    });
+    const allCustomers = await prisma.customer.findMany();
 
-    if (q) {
-      const qNormalized = normalizeText(q).trim();
-      const tokens = qNormalized.split(/\s+/).filter(Boolean);
-      const digits = q.replace(/[^0-9]/g, '');
-
-      customers = customers.filter((c) => {
-        const nameNorm = normalizeText(c.name);
-        const phoneNorm = normalizeText(c.phone || '');
-        const phoneDigits = (c.phone || '').replace(/[^0-9]/g, '');
-
-        // Match all search tokens across either name or phone
-        const matchesTokens = tokens.length > 0 && tokens.every(
-          (tok) => nameNorm.includes(tok) || phoneNorm.includes(tok)
-        );
-
-        // Also check if they searched for specific digits and they match a subsequence of the phone
-        const matchesDigits = !!(digits && phoneDigits.includes(digits));
-
-        return matchesTokens || matchesDigits;
-      });
-    }
-
-    customers = customers.slice(0, limit);
-
-    // Compute order_count for delivered orders using Prisma aggregate or count
     const deliveredOrders = await prisma.order.findMany({
-      where: { status: 'entregado' },
+      where: { status: { not: 'cancelado' }, is_quote: false },
       select: { customer_id: true, customer_phone: true },
     });
 
     const phoneMap = new Map<string, string>();
-    customers.forEach((c) => {
+    allCustomers.forEach((c) => {
       const pDigits = (c.phone || '').replace(/[^0-9]/g, '');
       if (pDigits.length >= 7) {
         phoneMap.set(pDigits.slice(-10), c.id);
@@ -367,10 +431,34 @@ app.get('/api/customers', requireRoles('admin', 'vendedor'), async (req: Request
       }
     });
 
-    const out = customers.map((c) => ({
+    let list = allCustomers.map((c) => ({
       ...formatCustomer(c),
       order_count: countsMap.get(c.id) || 0,
     }));
+
+    if (q) {
+      const qNormalized = normalizeText(q).trim();
+      const tokens = qNormalized.split(/\s+/).filter(Boolean);
+      const digits = q.replace(/[^0-9]/g, '');
+
+      list = list.filter((c) => {
+        const nameNorm = normalizeText(c.name);
+        const phoneNorm = normalizeText(c.phone || '');
+        const phoneDigits = (c.phone || '').replace(/[^0-9]/g, '');
+
+        const matchesTokens = tokens.length > 0 && tokens.every(
+          (tok) => nameNorm.includes(tok) || phoneNorm.includes(tok)
+        );
+        const matchesDigits = !!(digits && phoneDigits.includes(digits));
+
+        return matchesTokens || matchesDigits;
+      });
+    }
+
+    // Sort by order_count desc (most delivered orders to least), then created_at desc
+    list.sort((a, b) => (b.order_count - a.order_count) || (new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()));
+
+    const out = list.slice(0, limit);
 
     res.json(out);
   } catch (err: any) {
@@ -451,6 +539,38 @@ app.put('/api/customers/:customer_id', requireRoles('admin', 'vendedor'), async 
   } catch (err: any) {
     console.error('Error updating customer:', err);
     res.status(500).json({ detail: 'Error al actualizar cliente' });
+  }
+});
+
+app.put('/api/customers/bulk-gender', requireRoles('admin', 'vendedor'), async (req: Request, res: Response) => {
+  try {
+    const customers = req.body?.customers;
+    if (!Array.isArray(customers)) {
+      res.status(400).json({ detail: 'Formato de clientes inválido' });
+      return;
+    }
+
+    for (const c of customers) {
+      if (c.id) {
+        const genderVal = c.gender === 'M' || c.gender === 'F' ? c.gender : null;
+        await prisma.customer.update({
+          where: { id: c.id },
+          data: { gender: genderVal },
+        }).catch(() => {});
+
+        await prisma.order.updateMany({
+          where: { customer_id: c.id },
+          data: { customer_gender: genderVal },
+        }).catch(() => {});
+      }
+    }
+
+    broadcastEvent('customers_changed');
+    broadcastEvent('orders_changed');
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('Error in bulk customer gender update:', err);
+    res.status(500).json({ detail: 'Error al actualizar géneros de clientes' });
   }
 });
 
@@ -774,6 +894,99 @@ app.get('/api/orders/available', requireRoles('delivery'), async (req: Request, 
   }
 });
 
+// Real-time driver GPS tracking store
+const activeDriverLocations = new Map<string, {
+  driver_id: string;
+  driver_name: string;
+  lat: number;
+  lng: number;
+  heading: number;
+  speed: number;
+  order_id?: string;
+  updated_at: string;
+}>();
+
+app.post('/api/delivery/location', requireRoles('delivery', 'admin'), async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const { lat, lng, heading = 0, speed = 0, order_id } = req.body || {};
+
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      res.status(400).json({ detail: 'Coordenadas lat y lng requeridas' });
+      return;
+    }
+
+    const now = new Date();
+
+    // Fetch user to check current location_updated_at to avoid out-of-order queue replays
+    const dbUser = await prisma.user.findUnique({ where: { id: user.user_id } });
+    if (dbUser && dbUser.location_updated_at) {
+      const dbTime = new Date(dbUser.location_updated_at);
+      if (dbTime.getTime() >= now.getTime()) {
+        console.log(`[DELIVERY GPS SKIP] Position skipped for ${user.name || user.username}. Incoming timestamp is older/equal to DB.`);
+        res.json({ status: 'ok', message: 'Skipped older position' });
+        return;
+      }
+    }
+
+    // Persist to database so it matches traccar and registers correctly in /api/delivery/locations
+    await prisma.user.update({
+      where: { id: user.user_id },
+      data: {
+        location_lat: lat,
+        location_lng: lng,
+        location_updated_at: now,
+      },
+    });
+
+    const locData = {
+      driver_id: user.user_id,
+      driver_name: user.username || user.name || 'Repartidor',
+      lat,
+      lng,
+      heading: parseFloat(heading || 0),
+      speed: parseFloat(speed || 0),
+      order_id: order_id || undefined,
+      updated_at: now.toISOString(),
+    };
+
+    activeDriverLocations.set(user.user_id, locData);
+    if (order_id) {
+      activeDriverLocations.set(`order_${order_id}`, locData);
+    }
+
+    // Broadcast both events to be fully compatible with any listener
+    broadcastEvent('driver_location_changed', locData);
+    broadcastEvent('location_update', {
+      driver_id: user.user_id,
+      name: user.name || user.username || 'Repartidor',
+      username: user.username,
+      color: dbUser?.color || null,
+      photo_url: dbUser?.photo_data_url || null,
+      lat,
+      lng,
+      speed: parseFloat(speed || 0),
+      bearing: parseFloat(heading || 0),
+      updated_at: now.toISOString(),
+    });
+
+    res.json({ status: 'ok', location: locData });
+  } catch (err: any) {
+    console.error('Error posting driver location:', err);
+    res.status(500).json({ detail: 'Error al actualizar ubicación' });
+  }
+});
+
+app.get('/api/delivery/location/:order_id', requireRoles('admin', 'vendedor', 'delivery'), async (req: Request, res: Response) => {
+  try {
+    const { order_id } = req.params;
+    const loc = activeDriverLocations.get(`order_${order_id}`) || null;
+    res.json({ location: loc });
+  } catch (err: any) {
+    res.status(500).json({ detail: 'Error al consultar ubicación' });
+  }
+});
+
 app.post('/api/orders/:order_id/take', requireRoles('delivery'), async (req: AuthRequest, res: Response) => {
   try {
     const { order_id } = req.params;
@@ -918,44 +1131,50 @@ app.post('/api/orders', requireRoles('admin', 'vendedor'), async (req: AuthReque
         res.status(404).json({ detail: 'Cliente no encontrado' });
         return;
       }
-    } else if (!data.is_quote) {
+    } else if (!data.is_quote && data.order_type !== 'tienda') {
       res.status(400).json({ detail: 'Cliente requerido' });
       return;
     }
 
-    const isPickup = data.order_type === 'pickup';
+    const orderType = ['pickup', 'tienda'].includes(data.order_type) ? data.order_type : 'delivery';
+    const isDelivery = orderType === 'delivery';
     const items: any[] = data.items || [];
     const itemsTotal = items.reduce((sum, i) => sum + (i.quantity || 0) * (i.price_usd || 0), 0);
-    const fee = isPickup ? 0 : parseFloat(data.delivery_fee || 0);
+    const fee = isDelivery ? parseFloat(data.delivery_fee || 0) : 0;
     const totalUsd = itemsTotal + fee;
     const orderId = uuidv4();
 
-    let addressToStore = data.delivery_address || '';
+    let addressToStore = isDelivery ? (data.delivery_address || '') : '';
     let coords: [number, number] | null = null;
-    if (typeof data.lat === 'number' && typeof data.lng === 'number') {
-      coords = [data.lat, data.lng];
-      addressToStore = `https://www.google.com/maps/?q=${coords[0]},${coords[1]}`;
-    } else if (data.delivery_address) {
-      coords = parseCoordsFromUrl(data.delivery_address);
+    if (isDelivery) {
+      if (typeof data.lat === 'number' && typeof data.lng === 'number') {
+        coords = [data.lat, data.lng];
+        addressToStore = `https://www.google.com/maps/?q=${coords[0]},${coords[1]}`;
+      } else if (data.delivery_address) {
+        coords = parseCoordsFromUrl(data.delivery_address);
+      }
     }
 
     const now = new Date();
+    const isTiendaAutoDeliver = !data.is_quote && orderType === 'tienda';
+
     const newOrder = await prisma.order.create({
       data: {
         id: orderId,
         order_number: `PED-${orderId.substring(0, 8).toUpperCase()}`,
         customer_id: data.customer_id || null,
-        customer_name: customer ? customer.name : '(Cotización sin cliente)',
-        customer_phone: customer ? customer.phone : '',
+        customer_name: customer ? customer.name : (orderType === 'tienda' ? 'Venta en Tienda' : '(Cotización sin cliente)'),
+        customer_phone: customer ? customer.phone : (orderType === 'tienda' ? 'N/A' : ''),
         customer_gender: customer ? customer.gender || null : null,
-        order_type: isPickup ? 'pickup' : 'delivery',
+        order_type: orderType,
         delivery_address: addressToStore,
         lat: coords ? coords[0] : null,
         lng: coords ? coords[1] : null,
         delivery_id: null,
-        delivery_name: isPickup ? 'Pickup en tienda' : null,
+        delivery_name: orderType === 'pickup' ? 'Pickup en tienda' : (orderType === 'tienda' ? 'Venta en tienda' : null),
         delivery_fee: fee,
-        status: data.is_quote ? 'cotizacion' : 'pendiente',
+        status: data.is_quote ? 'cotizacion' : (isTiendaAutoDeliver ? 'entregado' : 'pendiente'),
+        delivered_at: isTiendaAutoDeliver ? now : null,
         is_quote: Boolean(data.is_quote),
         quote_description: data.is_quote ? (data.quote_description || '').trim() : null,
         scheduled_for: data.scheduled_for || null,
@@ -1011,7 +1230,7 @@ app.post('/api/orders', requireRoles('admin', 'vendedor'), async (req: AuthReque
       }
 
       // Notify delivery staff
-      if (!isPickup) {
+      if (isDelivery) {
         const deliveries = await prisma.user.findMany({ where: { role: 'delivery' } });
         for (const u of deliveries) {
           await prisma.notification.create({
@@ -1052,10 +1271,10 @@ app.patch('/api/orders/:order_id', requireRoles('admin', 'vendedor'), async (req
     const newOrderType = data.order_type !== undefined ? data.order_type : order.order_type;
     updateData.order_type = newOrderType;
 
-    if (newOrderType === 'pickup') {
+    if (newOrderType === 'pickup' || newOrderType === 'tienda') {
       updateData.delivery_fee = 0;
       updateData.delivery_id = null;
-      updateData.delivery_name = null;
+      updateData.delivery_name = newOrderType === 'pickup' ? 'Pickup en tienda' : 'Venta en tienda';
       updateData.lat = null;
       updateData.lng = null;
       updateData.total_usd = Math.round((order.items_total) * 100) / 100;
@@ -1184,12 +1403,17 @@ app.post('/api/orders/:order_id/assign-delivery', requireRoles('admin', 'vendedo
       return;
     }
 
+    const updateData: any = {
+      delivery_id,
+      delivery_name: deliveryUser.name,
+    };
+    if (order.status === 'en_camino') {
+      updateData.status = 'pendiente';
+    }
+
     await prisma.order.update({
       where: { id: order_id },
-      data: {
-        delivery_id,
-        delivery_name: deliveryUser.name,
-      },
+      data: updateData,
     });
 
     await prisma.notification.create({
@@ -1324,9 +1548,39 @@ app.patch('/api/orders/:order_id/status', authMiddleware, async (req: AuthReques
     if (newStatus === 'entregado' && oldStatus !== 'entregado') {
       updateData.delivered_at = now;
       updateData.route_polyline = null;
+
+      const adminVendors = await prisma.user.findMany({ where: { role: { in: ['admin', 'vendedor'] } } });
+      for (const u of adminVendors) {
+        if (u.id !== user.user_id) {
+          await prisma.notification.create({
+            data: {
+              id: uuidv4(),
+              user_id: u.id,
+              type: 'order_delivered',
+              order_id,
+              message: `El pedido ${order.order_number} (${order.customer_name}) ha sido entregado por ${user.name}`,
+            },
+          });
+        }
+      }
     }
     if (oldStatus === 'entregado' && newStatus !== 'entregado') {
       updateData.delivered_at = null;
+
+      const adminVendors = await prisma.user.findMany({ where: { role: { in: ['admin', 'vendedor'] } } });
+      for (const u of adminVendors) {
+        if (u.id !== user.user_id) {
+          await prisma.notification.create({
+            data: {
+              id: uuidv4(),
+              user_id: u.id,
+              type: 'order_reverted',
+              order_id,
+              message: `${user.name} revirtió el pedido ${order.order_number} (${order.customer_name}) a ${newStatus === 'en_camino' ? 'En Camino' : 'Pendiente'}`,
+            },
+          });
+        }
+      }
     }
 
     if (
@@ -1405,9 +1659,26 @@ app.get('/api/settings', authMiddleware, async (req: Request, res: Response) => 
             central_point_url: settings.central_point_url,
             central_point_lat: settings.central_point_lat,
             central_point_lng: settings.central_point_lng,
+            logo_url: settings.logo_url || '/logo.svg',
+            favicon_url: settings.favicon_url || '/isotipo.webp',
+            font_family: settings.font_family || 'Playfair Display',
+            primary_color: settings.primary_color || '#501122',
+            secondary_color: settings.secondary_color || '#FBF7F0',
+            app_title: settings.app_title || "Lubo's Tiramisú",
+            app_subtitle: settings.app_subtitle || 'Gestión y Logística',
             updated_at: settings.updated_at ? settings.updated_at.toISOString() : undefined,
           }
-        : { exchange_rate_ves: 36.5, delivery_driver_pct: 85.0 }
+        : {
+            exchange_rate_ves: 36.5,
+            delivery_driver_pct: 85.0,
+            logo_url: '/logo.svg',
+            favicon_url: '/isotipo.webp',
+            font_family: 'Playfair Display',
+            primary_color: '#501122',
+            secondary_color: '#FBF7F0',
+            app_title: "Lubo's Tiramisú",
+            app_subtitle: 'Gestión y Logística',
+          }
     );
   } catch (err: any) {
     console.error('Error getting settings:', err);
@@ -1417,11 +1688,31 @@ app.get('/api/settings', authMiddleware, async (req: Request, res: Response) => 
 
 app.put('/api/settings', requireRoles('admin'), async (req: Request, res: Response) => {
   try {
-    const { exchange_rate_ves, delivery_driver_pct, central_point_url, central_point_lat, central_point_lng } = req.body || {};
+    const {
+      exchange_rate_ves,
+      delivery_driver_pct,
+      central_point_url,
+      central_point_lat,
+      central_point_lng,
+      logo_url,
+      favicon_url,
+      font_family,
+      primary_color,
+      secondary_color,
+      app_title,
+      app_subtitle,
+    } = req.body || {};
     const updateData: any = {};
 
     if (exchange_rate_ves !== undefined) updateData.exchange_rate_ves = parseFloat(exchange_rate_ves);
     if (delivery_driver_pct !== undefined) updateData.delivery_driver_pct = parseFloat(delivery_driver_pct);
+    if (logo_url !== undefined) updateData.logo_url = logo_url;
+    if (favicon_url !== undefined) updateData.favicon_url = favicon_url;
+    if (font_family !== undefined) updateData.font_family = font_family;
+    if (primary_color !== undefined) updateData.primary_color = primary_color;
+    if (secondary_color !== undefined) updateData.secondary_color = secondary_color;
+    if (app_title !== undefined) updateData.app_title = app_title;
+    if (app_subtitle !== undefined) updateData.app_subtitle = app_subtitle;
 
     if (central_point_url !== undefined) {
       if (central_point_url === '') {
@@ -1451,9 +1742,18 @@ app.put('/api/settings', requireRoles('admin'), async (req: Request, res: Respon
         key: 'app_settings',
         exchange_rate_ves: updateData.exchange_rate_ves ?? 36.5,
         delivery_driver_pct: updateData.delivery_driver_pct ?? 85.0,
+        logo_url: updateData.logo_url ?? '/logo.svg',
+        favicon_url: updateData.favicon_url ?? '/isotipo.webp',
+        font_family: updateData.font_family ?? 'Playfair Display',
+        primary_color: updateData.primary_color ?? '#501122',
+        secondary_color: updateData.secondary_color ?? '#FBF7F0',
+        app_title: updateData.app_title ?? "Lubo's Tiramisú",
+        app_subtitle: updateData.app_subtitle ?? 'Gestión y Logística',
         ...updateData,
       },
     });
+
+    broadcastEvent('settings_changed');
 
     res.json({
       key: settings.key,
@@ -1462,6 +1762,13 @@ app.put('/api/settings', requireRoles('admin'), async (req: Request, res: Respon
       central_point_url: settings.central_point_url,
       central_point_lat: settings.central_point_lat,
       central_point_lng: settings.central_point_lng,
+      logo_url: settings.logo_url || '/logo.svg',
+      favicon_url: settings.favicon_url || '/isotipo.webp',
+      font_family: settings.font_family || 'Playfair Display',
+      primary_color: settings.primary_color || '#501122',
+      secondary_color: settings.secondary_color || '#FBF7F0',
+      app_title: settings.app_title || "Lubo's Tiramisú",
+      app_subtitle: settings.app_subtitle || 'Gestión y Logística',
       updated_at: settings.updated_at ? settings.updated_at.toISOString() : undefined,
     });
   } catch (err: any) {
@@ -1547,9 +1854,23 @@ app.get('/api/public/stock', async (req: Request, res: Response) => {
 
 app.get('/api/bcv-rate', authMiddleware, async (req: Request, res: Response) => {
   try {
-    const settings = await prisma.appSettings.findUnique({ where: { key: 'app_settings' } });
-    const rate = settings?.exchange_rate_ves || 36.5;
-    res.json({ rate, source: 'bcv_official', updated: true });
+    console.log('[API/BCV-RATE] Manual request received, fetching live rate...');
+    const liveRate = await fetchLiveBcvRate();
+    if (liveRate && liveRate > 0) {
+      const settings = await prisma.appSettings.upsert({
+        where: { key: 'app_settings' },
+        update: { exchange_rate_ves: liveRate },
+        create: { key: 'app_settings', exchange_rate_ves: liveRate, delivery_driver_pct: 85.0 }
+      });
+      console.log(`[API/BCV-RATE] Database successfully updated to live rate: ${liveRate}`);
+      broadcastEvent('settings_changed');
+      res.json({ rate: liveRate, source: 'bcv_official', updated: true });
+    } else {
+      // Fallback to currently stored rate
+      const settings = await prisma.appSettings.findUnique({ where: { key: 'app_settings' } });
+      const rate = settings?.exchange_rate_ves || 36.5;
+      res.json({ rate, source: 'bcv_official', updated: false, message: 'Fallback to DB rate' });
+    }
   } catch (err: any) {
     console.error('Error getting BCV rate:', err);
     res.status(500).json({ detail: 'Error al obtener tasa BCV' });
@@ -1713,17 +2034,21 @@ app.get('/api/finance/daily', requireRoles('admin'), async (req: Request, res: R
 
 app.get('/api/dashboard/client-stats', requireRoles('admin', 'vendedor'), async (req: Request, res: Response) => {
   try {
-    const customers = await prisma.customer.findMany({ orderBy: { created_at: 'desc' } });
-    const formattedCustomers = customers.map(formatCustomer);
-    const total_customers = formattedCustomers.length;
+    const q = (req.query.q as string || '').trim();
+    const limit = Math.max(1, Math.min(parseInt((req.query.limit as string) || '50', 10), 200));
+
+    const total_customers = await prisma.customer.count();
 
     const deliveredOrders = await prisma.order.findMany({
-      where: { status: 'entregado' },
+      where: { status: { not: 'cancelado' }, is_quote: false },
       select: { customer_id: true, customer_phone: true },
     });
 
+    const allCustomers = await prisma.customer.findMany();
+    const formattedCustomers = allCustomers.map(formatCustomer);
+
     const phoneMap = new Map<string, string>();
-    customers.forEach((c) => {
+    allCustomers.forEach((c) => {
       const pDigits = (c.phone || '').replace(/[^0-9]/g, '');
       if (pDigits.length >= 7) {
         phoneMap.set(pDigits.slice(-10), c.id);
@@ -1742,12 +2067,36 @@ app.get('/api/dashboard/client-stats', requireRoles('admin', 'vendedor'), async 
       }
     });
 
-    const listWithCounts = formattedCustomers.map((c) => ({
+    let listWithCounts = formattedCustomers.map((c) => ({
       ...c,
       order_count: countsMap.get(c.id) || 0,
     }));
 
     const repeat_customers = listWithCounts.filter((c) => (c.order_count || 0) > 1).length;
+
+    if (q) {
+      const qNormalized = normalizeText(q).trim();
+      const tokens = qNormalized.split(/\s+/).filter(Boolean);
+      const digits = q.replace(/[^0-9]/g, '');
+
+      listWithCounts = listWithCounts.filter((c) => {
+        const nameNorm = normalizeText(c.name);
+        const phoneNorm = normalizeText(c.phone || '');
+        const phoneDigits = (c.phone || '').replace(/[^0-9]/g, '');
+
+        const matchesTokens = tokens.length > 0 && tokens.every(
+          (tok) => nameNorm.includes(tok) || phoneNorm.includes(tok)
+        );
+        const matchesDigits = !!(digits && phoneDigits.includes(digits));
+
+        return matchesTokens || matchesDigits;
+      });
+    }
+
+    // Sort by order_count desc (most delivered orders to least), then created_at desc
+    listWithCounts.sort((a, b) => (b.order_count - a.order_count) || (new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()));
+
+    const topCustomers = listWithCounts.slice(0, limit);
 
     res.json({
       total_customers,
@@ -1755,7 +2104,7 @@ app.get('/api/dashboard/client-stats', requireRoles('admin', 'vendedor'), async 
       active_in_period: total_customers,
       period_revenue: 0,
       period_orders: 0,
-      customers: listWithCounts,
+      customers: topCustomers,
     });
   } catch (err: any) {
     console.error('Error getting client stats:', err);
@@ -1770,7 +2119,7 @@ app.get('/api/dashboard/stats', requireRoles('admin', 'vendedor'), async (req: R
     const total_pending = await prisma.order.count({ where: { status: 'pendiente' } });
 
     const deliveredOrders = await prisma.order.findMany({
-      where: { status: 'entregado' },
+      where: { status: { not: 'cancelado' }, is_quote: false },
       select: { total_usd: true },
     });
     const total_revenue_usd = deliveredOrders.reduce((sum, o) => sum + (o.total_usd || 0), 0);
@@ -1947,54 +2296,75 @@ app.get('/api/dashboard/report', requireRoles('admin'), async (req: Request, res
     });
 
     const total_orders = filteredOrders.length;
-    const deliveredOrders = filteredOrders.filter((o) => o.status === 'entregado');
+    const paidOrders = filteredOrders.filter((o) => o.status !== 'cancelado');
     const cancelledOrders = filteredOrders.filter((o) => o.status === 'cancelado');
-    const total_delivered = deliveredOrders.length;
+    const total_delivered = paidOrders.length;
     const total_cancelled = cancelledOrders.length;
     const cancellation_rate = total_orders > 0 ? Math.round((total_cancelled / total_orders) * 1000) / 10 : 0;
 
-    const total_revenue = Math.round(deliveredOrders.reduce((sum, o) => sum + (o.total_usd || 0), 0) * 100) / 100;
-    const delivery_revenue = Math.round(deliveredOrders.reduce((sum, o) => sum + (o.delivery_fee || 0), 0) * 100) / 100;
+    const total_revenue = Math.round(paidOrders.reduce((sum, o) => sum + (o.total_usd || 0), 0) * 100) / 100;
+    const delivery_revenue = Math.round(paidOrders.reduce((sum, o) => sum + (o.delivery_fee || 0), 0) * 100) / 100;
     const product_revenue = Math.round((total_revenue - delivery_revenue) * 100) / 100;
 
     const avg_ticket = total_delivered > 0 ? Math.round((total_revenue / total_delivered) * 100) / 100 : 0;
 
-    const pickupOrders = deliveredOrders.filter((o) => o.order_type === 'pickup');
-    const deliveryOrders = deliveredOrders.filter((o) => o.order_type !== 'pickup');
+    const pickupOrders = paidOrders.filter((o) => o.order_type === 'pickup');
+    const tiendaOrders = paidOrders.filter((o) => o.order_type === 'tienda');
+    const deliveryOrders = paidOrders.filter((o) => o.order_type !== 'pickup' && o.order_type !== 'tienda');
     const pickup_count = pickupOrders.length;
+    const tienda_count = tiendaOrders.length;
     const delivery_count = deliveryOrders.length;
     const pickup_revenue = Math.round(pickupOrders.reduce((sum, o) => sum + (o.total_usd || 0), 0) * 100) / 100;
+    const tienda_revenue = Math.round(tiendaOrders.reduce((sum, o) => sum + (o.total_usd || 0), 0) * 100) / 100;
     const delivery_orders_revenue = Math.round(deliveryOrders.reduce((sum, o) => sum + (o.total_usd || 0), 0) * 100) / 100;
 
-    // Customer counts in period
-    const periodCustomerNames = new Set<string>(
-      filteredOrders.map((o) => o.customer_name).filter((name): name is string => Boolean(name))
-    );
-    const unique_customers = periodCustomerNames.size || allCustomers.length;
-
-    const customerFirstOrderMap = new Map<string, string>();
-    allOrders.forEach((o) => {
-      if (!o.is_quote && o.customer_name) {
-        const dt = o.created_at.toISOString().substring(0, 10);
-        if (!customerFirstOrderMap.has(o.customer_name) || dt < customerFirstOrderMap.get(o.customer_name)!) {
-          customerFirstOrderMap.set(o.customer_name, dt);
-        }
+    // Customer counts and repeat calculation (> 1 paid order)
+    const phoneMap = new Map<string, string>();
+    allCustomers.forEach((c) => {
+      const pDigits = (c.phone || '').replace(/[^0-9]/g, '');
+      if (pDigits.length >= 7) {
+        phoneMap.set(pDigits.slice(-10), c.id);
       }
     });
 
-    let new_customers = 0;
-    periodCustomerNames.forEach((cName) => {
-      const firstDt = customerFirstOrderMap.get(cName);
-      if (firstDt && (!startDateStr || firstDt >= startDateStr) && (!endDateStr || firstDt <= endDateStr)) {
-        new_customers++;
+    const countsMap = new Map<string, number>();
+    const allPaidOrders = allOrders.filter((o) => o.status !== 'cancelado' && !o.is_quote);
+    allPaidOrders.forEach((o) => {
+      let cId = o.customer_id;
+      if (!cId && o.customer_phone) {
+        const oDigits = o.customer_phone.replace(/[^0-9]/g, '');
+        if (oDigits.length >= 7) cId = phoneMap.get(oDigits.slice(-10)) || null;
+      }
+      if (cId) {
+        countsMap.set(cId, (countsMap.get(cId) || 0) + 1);
       }
     });
-    const repeat_customers = Math.max(0, unique_customers - new_customers);
+
+    const unique_customers = allCustomers.length || 1;
+    let customers_1_order = 0;
+    let customers_2_orders = 0;
+    let customers_3_orders = 0;
+    let customers_4_plus_orders = 0;
+
+    allCustomers.forEach((c) => {
+      const cnt = countsMap.get(c.id) || 0;
+      if (cnt === 1) customers_1_order++;
+      else if (cnt === 2) customers_2_orders++;
+      else if (cnt === 3) customers_3_orders++;
+      else if (cnt >= 4) customers_4_plus_orders++;
+    });
+
+    const repeat_customers = customers_2_orders + customers_3_orders + customers_4_plus_orders;
+    const new_customers = customers_1_order;
     const retention_rate = unique_customers > 0 ? Math.round((repeat_customers / unique_customers) * 100) : 0;
+    const pct_1_order = unique_customers > 0 ? Math.round((customers_1_order / unique_customers) * 100) : 0;
+    const pct_2_orders = unique_customers > 0 ? Math.round((customers_2_orders / unique_customers) * 100) : 0;
+    const pct_3_orders = unique_customers > 0 ? Math.round((customers_3_orders / unique_customers) * 100) : 0;
+    const pct_4_plus_orders = unique_customers > 0 ? Math.round((customers_4_plus_orders / unique_customers) * 100) : 0;
 
     // Daily Chart
     const dailyMap = new Map<string, { revenue: number; orders: number }>();
-    deliveredOrders.forEach((o) => {
+    paidOrders.forEach((o) => {
       const dStr = o.created_at.toISOString().substring(0, 10);
       const cur = dailyMap.get(dStr) || { revenue: 0, orders: 0 };
       cur.revenue += o.total_usd || 0;
@@ -2003,7 +2373,9 @@ app.get('/api/dashboard/report', requireRoles('admin'), async (req: Request, res
     });
 
     const daily_chart: Array<{ date: string; revenue: number; orders: number }> = [];
-    if (startDateStr && endDateStr) {
+    const validStart = startDateStr && !isNaN(new Date(`${startDateStr}T00:00:00.000Z`).getTime());
+    const validEnd = endDateStr && !isNaN(new Date(`${endDateStr}T00:00:00.000Z`).getTime());
+    if (validStart && validEnd) {
       const curDate = new Date(`${startDateStr}T00:00:00.000Z`);
       const endDate = new Date(`${endDateStr}T00:00:00.000Z`);
       while (curDate <= endDate) {
@@ -2080,7 +2452,7 @@ app.get('/api/dashboard/report', requireRoles('admin'), async (req: Request, res
     // Top Flavors
     const flavorStatsMap = new Map<string, { quantity: number; revenue: number }>();
     let totalFlavorQty = 0;
-    deliveredOrders.forEach((o) => {
+    paidOrders.forEach((o) => {
       o.items.forEach((it) => {
         const name = it.flavor_name || 'Sin sabor';
         const cur = flavorStatsMap.get(name) || { quantity: 0, revenue: 0 };
@@ -2105,7 +2477,7 @@ app.get('/api/dashboard/report', requireRoles('admin'), async (req: Request, res
 
     // Top Customers
     const customerSpentMap = new Map<string, { id: string; name: string; phone: string; total_orders: number; total_spent: number }>();
-    deliveredOrders.forEach((o) => {
+    paidOrders.forEach((o) => {
       const name = o.customer_name || 'Cliente';
       const cur = customerSpentMap.get(name) || {
         id: o.customer_id || name,
@@ -2125,13 +2497,13 @@ app.get('/api/dashboard/report', requireRoles('admin'), async (req: Request, res
       .slice(0, 5);
 
     // Delivery Ranking
-    const driverStatsMap = new Map<string, { id: string; name: string; delivered: number; earnings: number; km_delivered: number; avg_mins: number }>();
+    const driverStatsMap = new Map<string, { id: string; name: string; delivered: number; earnings: number; revenue: number; km_delivered: number; avg_mins: number }>();
     dbDrivers.forEach((d) => {
-      driverStatsMap.set(d.id, { id: d.id, name: d.name, delivered: 0, earnings: 0, km_delivered: 0, avg_mins: 25 });
+      driverStatsMap.set(d.id, { id: d.id, name: d.name, delivered: 0, earnings: 0, revenue: 0, km_delivered: 0, avg_mins: 25 });
     });
 
-    deliveredOrders.forEach((o) => {
-      if (o.order_type === 'pickup') return;
+    paidOrders.forEach((o) => {
+      if (o.order_type === 'pickup' || o.order_type === 'tienda') return;
       let dKey = o.delivery_id;
       if (!dKey && o.delivery_name) {
         const match = dbDrivers.find((d) => d.name.toLowerCase() === o.delivery_name!.toLowerCase());
@@ -2141,32 +2513,68 @@ app.get('/api/dashboard/report', requireRoles('admin'), async (req: Request, res
         const st = driverStatsMap.get(dKey)!;
         st.delivered += 1;
         st.earnings += o.delivery_fee || 0;
+        st.revenue += o.total_usd || 0;
         st.km_delivered += 3.5;
       } else if (o.delivery_name) {
         const dKey = o.delivery_name;
         if (!driverStatsMap.has(dKey)) {
-          driverStatsMap.set(dKey, { id: dKey, name: o.delivery_name, delivered: 0, earnings: 0, km_delivered: 0, avg_mins: 25 });
+          driverStatsMap.set(dKey, { id: dKey, name: o.delivery_name, delivered: 0, earnings: 0, revenue: 0, km_delivered: 0, avg_mins: 25 });
         }
         const st = driverStatsMap.get(dKey)!;
         st.delivered += 1;
         st.earnings += o.delivery_fee || 0;
+        st.revenue += o.total_usd || 0;
         st.km_delivered += 3.5;
       }
     });
 
     const delivery_ranking = Array.from(driverStatsMap.values())
-      .map((d) => ({ ...d, earnings: Math.round(d.earnings * 100) / 100, km_delivered: Math.round(d.km_delivered * 10) / 10 }))
+      .map((d) => ({
+        ...d,
+        earnings: Math.round(d.earnings * 100) / 100,
+        revenue: Math.round(d.revenue * 100) / 100,
+        km_delivered: Math.round(d.km_delivered * 10) / 10,
+      }))
       .filter((d) => d.delivered > 0)
       .sort((a, b) => b.delivered - a.delivered);
 
     // Quote conversion
+    const allQuotesAndConverted = await prisma.order.findMany({
+      where: {
+        OR: [
+          { is_quote: true },
+          {
+            is_quote: false,
+            quote_description: { not: null },
+          },
+        ],
+      },
+      select: {
+        id: true,
+        is_quote: true,
+        status: true,
+        total_usd: true,
+        quote_description: true,
+      },
+    });
+
+    const pending_quotes = allQuotesAndConverted.filter((o) => o.is_quote).length;
+    const converted_orders = allQuotesAndConverted.filter(
+      (o) => !o.is_quote && o.quote_description && o.quote_description.trim() !== ''
+    ).length;
+    const total_quotes = pending_quotes + converted_orders;
+    const conversion_rate = total_quotes > 0 ? Math.round((converted_orders / total_quotes) * 100) : 0;
+    const revenue_from_quotes = allQuotesAndConverted
+      .filter((o) => !o.is_quote && o.quote_description && o.quote_description.trim() !== '' && o.status === 'entregado')
+      .reduce((sum, o) => sum + o.total_usd, 0);
+
     const quote_funnel = {
-      total_quotes: 0,
-      converted_orders: 0,
-      conversion_rate: 100,
-      revenue_from_quotes: 0,
-      pending_quotes: 0,
-      avg_conversion_time_hours: 1,
+      total_quotes,
+      converted_orders,
+      conversion_rate,
+      revenue_from_quotes,
+      pending_quotes,
+      avg_conversion_time_hours: 1.5,
     };
 
     // Product matrix
@@ -2184,10 +2592,10 @@ app.get('/api/dashboard/report', requireRoles('admin'), async (req: Request, res
     const customer_cohorts = {
       first_time_count: new_customers,
       repeat_count: repeat_customers,
-      retention_rate: retention_rate || 50,
+      retention_rate: retention_rate,
       avg_days_between_orders: 6,
-      avg_customer_ltv: unique_customers > 0 ? Math.round((total_revenue / unique_customers) * 100) / 100 : 25,
-      vip_customers_count: top_customers.filter((c) => c.total_orders >= 3).length,
+      avg_customer_ltv: unique_customers > 0 ? Math.round((total_revenue / unique_customers) * 100) / 100 : 0,
+      vip_customers_count: allCustomers.filter((c) => (countsMap.get(c.id) || 0) >= 3).length,
     };
 
     res.json({
@@ -2204,9 +2612,19 @@ app.get('/api/dashboard/report', requireRoles('admin'), async (req: Request, res
         new_customers,
         repeat_customers,
         retention_rate,
+        customers_1_order,
+        customers_2_orders,
+        customers_3_orders,
+        customers_4_plus_orders,
+        pct_1_order,
+        pct_2_orders,
+        pct_3_orders,
+        pct_4_plus_orders,
         pickup_count,
+        tienda_count,
         delivery_count,
         pickup_revenue,
+        tienda_revenue,
         delivery_orders_revenue,
       },
       peak_hour,
@@ -2232,41 +2650,554 @@ app.get('/api/dashboard/export', requireRoles('admin'), async (req: Request, res
   res.send('Numero,Fecha,Cliente,Total USD\n');
 });
 
-// ── 8. DELIVERY & ZONES ──
+function parseCsvRow(line: string): string[] {
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  result.push(current);
+  return result;
+}
 
-app.post('/api/delivery/location', requireRoles('delivery'), async (req: AuthRequest, res: Response) => {
+app.post('/api/dashboard/import-csv', requireRoles('admin', 'vendedor'), async (req: Request, res: Response) => {
   try {
-    const user = req.user!;
-    const { lat, lng } = req.body || {};
-    const now = new Date();
-    await prisma.user.update({
-      where: { id: user.user_id },
-      data: {
-        location_lat: lat,
-        location_lng: lng,
-        location_updated_at: now,
-      },
+    const { csvText } = req.body || {};
+    if (!csvText || typeof csvText !== 'string') {
+      res.status(400).json({ detail: 'Se requiere el contenido del archivo CSV' });
+      return;
+    }
+
+    const lines = csvText.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+    if (lines.length === 0) {
+      res.status(400).json({ detail: 'El archivo CSV está vacío' });
+      return;
+    }
+
+    // Check for BCV rate
+    for (const l of lines) {
+      if (l.toLowerCase().includes('tasa bcv:')) {
+        const match = l.match(/tasa\s+bcv:\s*([0-9.]+)/i);
+        if (match && match[1]) {
+          const rate = parseFloat(match[1]);
+          if (!isNaN(rate) && rate > 0) {
+            await prisma.appSettings.upsert({
+              where: { key: 'app_settings' },
+              update: { exchange_rate_ves: rate },
+              create: { key: 'app_settings', exchange_rate_ves: rate },
+            }).catch(() => {});
+          }
+        }
+      }
+    }
+
+    // Find table header row
+    let headerIndex = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const parsed = parseCsvRow(lines[i]);
+      const joined = parsed.join(',').toLowerCase();
+      if (joined.includes('numero') && (joined.includes('fecha') || joined.includes('cliente'))) {
+        headerIndex = i;
+        break;
+      }
+    }
+
+    if (headerIndex === -1) {
+      res.status(400).json({ detail: 'No se encontró el encabezado (Numero,Fecha,Cliente,...) en el CSV' });
+      return;
+    }
+
+    // Fetch existing db records for reference
+    const allCustomers = await prisma.customer.findMany();
+    const allFlavors = await prisma.flavor.findMany();
+    const allDrivers = await prisma.user.findMany({ where: { role: { in: ['repartidor', 'delivery'] } } });
+
+    // Track phone numbers and names -> customer
+    const customerPhoneMap = new Map<string, typeof allCustomers[0]>();
+    const customerNameMap = new Map<string, typeof allCustomers[0]>();
+
+    allCustomers.forEach((c) => {
+      customerNameMap.set(c.name.toLowerCase().trim(), c);
+      const digits = (c.phone || '').replace(/[^0-9]/g, '');
+      if (digits.length >= 7) {
+        customerPhoneMap.set(digits.slice(-10), c);
+      }
     });
-    res.json({ ok: true, updated_at: now.toISOString() });
+
+    const newlyCreatedCustomers: { id: string; name: string; phone: string; gender: string | null }[] = [];
+    let importedOrdersCount = 0;
+
+    for (let i = headerIndex + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line || line.startsWith('RESUMEN') || line.startsWith('Total pedidos')) {
+        break; // Reached summary section
+      }
+
+      const row = parseCsvRow(line);
+      if (row.length < 5) continue;
+
+      const orderNumber = row[0]?.trim();
+      const fecha = row[1]?.trim();
+      const hora = row[2]?.trim();
+      const cliente = row[3]?.trim();
+      const telefono = row[4]?.trim();
+      const saboresStr = row[5]?.trim();
+      const repartidor = row[6]?.trim();
+      const estado = row[7]?.trim();
+      const totalUsd = parseFloat(row[8]) || 0;
+      const totalVes = parseFloat(row[9]) || 0;
+      const deliveryUsd = parseFloat(row[10]) || 0;
+      const notas = row[11]?.trim() || '';
+
+      if (!orderNumber || !fecha) continue;
+
+      // Handle Customer
+      let customerId: string | null = null;
+      let customerName = cliente || '(Sin cliente)';
+      let customerPhone: string | null = telefono || null;
+      let customerGender: string | null = null;
+
+      const isAnon = !cliente || cliente === '(Cotizacion sin cliente)' || cliente === '(Sin cliente)';
+
+      if (!isAnon) {
+        const phoneDigits = (telefono || '').replace(/[^0-9]/g, '');
+        let existingCust: typeof allCustomers[0] | undefined;
+
+        if (phoneDigits.length >= 7) {
+          existingCust = customerPhoneMap.get(phoneDigits.slice(-10));
+        }
+        if (!existingCust && cliente) {
+          existingCust = customerNameMap.get(cliente.toLowerCase().trim());
+        }
+
+        if (existingCust) {
+          customerId = existingCust.id;
+          customerName = existingCust.name;
+          customerPhone = existingCust.phone;
+          customerGender = existingCust.gender || null;
+        } else {
+          // Create new customer
+          const createdCust = await prisma.customer.create({
+            data: {
+              name: cliente,
+              phone: telefono || '',
+              gender: null,
+            },
+          });
+          customerId = createdCust.id;
+          customerName = createdCust.name;
+          customerPhone = createdCust.phone;
+          customerGender = null;
+
+          // Register in lookup maps
+          customerNameMap.set(createdCust.name.toLowerCase().trim(), createdCust);
+          if (phoneDigits.length >= 7) {
+            customerPhoneMap.set(phoneDigits.slice(-10), createdCust);
+          }
+          allCustomers.push(createdCust);
+
+          newlyCreatedCustomers.push({
+            id: createdCust.id,
+            name: createdCust.name,
+            phone: createdCust.phone,
+            gender: null,
+          });
+        }
+      }
+
+      // Handle Delivery / Repartidor
+      const rep = (repartidor || '').trim();
+      let orderType = 'delivery';
+      let deliveryName: string | null = rep;
+      let deliveryId: string | null = null;
+
+      if (!rep || rep.toLowerCase().includes('pickup') || rep.toLowerCase().includes('tienda') || rep.toLowerCase().includes('cotizacion')) {
+        orderType = 'pickup';
+        deliveryName = rep || 'Pickup en tienda';
+      } else {
+        const matchDriver = allDrivers.find((d) =>
+          d.name.toLowerCase().trim() === rep.toLowerCase() ||
+          d.name.toLowerCase().includes(rep.toLowerCase()) ||
+          rep.toLowerCase().includes(d.name.toLowerCase())
+        );
+        if (matchDriver) {
+          deliveryId = matchDriver.id;
+          deliveryName = matchDriver.name;
+        }
+      }
+
+      // Handle Status & Dates
+      const est = (estado || '').trim().toLowerCase();
+      let status = 'pendiente';
+      let isQuote = false;
+
+      if (est === 'cotizacion' || est.includes('cotiza')) {
+        status = 'cotizacion';
+        isQuote = true;
+      } else if (est === 'entregado') {
+        status = 'entregado';
+      } else if (est === 'cancelado') {
+        status = 'cancelado';
+      } else if (est === 'pendiente') {
+        status = 'pendiente';
+      } else {
+        status = est || 'pendiente';
+      }
+
+      let orderCreatedAt = new Date();
+      if (fecha && /^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+        const timeStr = hora && /^\d{1,2}:\d{2}$/.test(hora) ? hora : '12:00';
+        const d = new Date(`${fecha}T${timeStr.length === 4 ? '0' + timeStr : timeStr}:00.000Z`);
+        if (!isNaN(d.getTime())) {
+          orderCreatedAt = d;
+        }
+      }
+
+      // Handle Items / Sabores
+      const itemParts = (saboresStr || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const parsedItems: { flavorName: string; quantity: number; flavorId: string; priceUsd: number }[] = [];
+
+      let totalItemQty = 0;
+      const tempItems: { flavorName: string; quantity: number }[] = [];
+
+      for (const part of itemParts) {
+        const m = part.match(/^(.*?)\s*x\s*(\d+)$/i);
+        if (m) {
+          const fn = m[1].trim();
+          const q = parseInt(m[2], 10) || 1;
+          tempItems.push({ flavorName: fn, quantity: q });
+          totalItemQty += q;
+        } else if (part) {
+          tempItems.push({ flavorName: part, quantity: 1 });
+          totalItemQty += 1;
+        }
+      }
+
+      const itemsTotalCalculated = Math.max(0, totalUsd - deliveryUsd);
+
+      for (const ti of tempItems) {
+        let matchedFlavor = allFlavors.find((f) => f.name.toLowerCase().trim() === ti.flavorName.toLowerCase());
+        if (!matchedFlavor) {
+          matchedFlavor = allFlavors.find((f) =>
+            f.name.toLowerCase().includes(ti.flavorName.toLowerCase()) ||
+            ti.flavorName.toLowerCase().includes(f.name.toLowerCase())
+          );
+        }
+
+        const flavorId = matchedFlavor ? matchedFlavor.id : (allFlavors[0]?.id || 'manual');
+        const flavorName = matchedFlavor ? matchedFlavor.name : ti.flavorName;
+        const itemPrice = matchedFlavor ? matchedFlavor.price_usd : Math.round((itemsTotalCalculated / (totalItemQty || 1)) * 100) / 100;
+
+        parsedItems.push({
+          flavorName,
+          quantity: ti.quantity,
+          flavorId,
+          priceUsd: itemPrice,
+        });
+      }
+
+      // Address
+      const deliveryAddress = orderType === 'pickup' ? 'Pickup en tienda' : (notas || 'Delivery');
+
+      // Check if order already exists in database by order_number
+      const existingOrder = await prisma.order.findFirst({
+        where: { order_number: orderNumber },
+      });
+
+      const orderData = {
+        order_number: orderNumber,
+        customer_id: customerId,
+        customer_name: customerName,
+        customer_phone: customerPhone,
+        customer_gender: customerGender,
+        order_type: orderType,
+        delivery_address: deliveryAddress,
+        delivery_id: deliveryId,
+        delivery_name: deliveryName,
+        delivery_fee: deliveryUsd,
+        status: status,
+        is_quote: isQuote,
+        total_usd: totalUsd,
+        items_total: itemsTotalCalculated,
+        notes: notas || null,
+        created_at: orderCreatedAt,
+        delivered_at: status === 'entregado' ? orderCreatedAt : null,
+      };
+
+      if (existingOrder) {
+        await prisma.orderItem.deleteMany({ where: { order_id: existingOrder.id } });
+        await prisma.order.update({
+          where: { id: existingOrder.id },
+          data: {
+            ...orderData,
+            items: {
+              create: parsedItems.map((pi) => ({
+                flavor_id: pi.flavorId,
+                flavor_name: pi.flavorName,
+                quantity: pi.quantity,
+                price_usd: pi.priceUsd,
+              })),
+            },
+          },
+        });
+      } else {
+        await prisma.order.create({
+          data: {
+            ...orderData,
+            items: {
+              create: parsedItems.map((pi) => ({
+                flavor_id: pi.flavorId,
+                flavor_name: pi.flavorName,
+                quantity: pi.quantity,
+                price_usd: pi.priceUsd,
+              })),
+            },
+          },
+        });
+      }
+
+      importedOrdersCount++;
+    }
+
+    // Recalculate order_count for all customers
+    const deliveredOrders = await prisma.order.findMany({
+      where: { status: { not: 'cancelado' }, is_quote: false },
+      select: { customer_id: true },
+    });
+    const countsMap = new Map<string, number>();
+    deliveredOrders.forEach((o) => {
+      if (o.customer_id) countsMap.set(o.customer_id, (countsMap.get(o.customer_id) || 0) + 1);
+    });
+
+    for (const c of allCustomers) {
+      const cnt = countsMap.get(c.id) || 0;
+      await prisma.customer.update({
+        where: { id: c.id },
+        data: { order_count: cnt },
+      }).catch(() => {});
+    }
+
+    broadcastEvent('customers_changed');
+    broadcastEvent('orders_changed');
+
+    res.json({
+      success: true,
+      importedCount: importedOrdersCount,
+      newCustomers: newlyCreatedCustomers,
+    });
   } catch (err: any) {
-    console.error('Error updating location:', err);
-    res.status(500).json({ detail: 'Error al actualizar ubicación' });
+    console.error('Error importing CSV:', err);
+    res.status(500).json({ detail: 'Error al procesar la importación CSV: ' + (err?.message || 'Error interno') });
   }
 });
 
-app.get('/api/delivery/locations', requireRoles('admin', 'vendedor'), async (req: Request, res: Response) => {
+// ── 8. DELIVERY & ZONES ──
+
+// ── TRACCAR CLIENT WEBHOOK ENDPOINT (GET & POST) ──
+const handleTraccarPing = async (req: Request, res: Response) => {
   try {
+    // 1. Extract params from URL search string
+    const urlParamsObj: Record<string, string> = {};
+    try {
+      const fullUrl = 'http://localhost' + (req.originalUrl || req.url || '');
+      const parsedUrl = new URL(fullUrl);
+      parsedUrl.searchParams.forEach((val, key) => {
+        urlParamsObj[key] = val;
+      });
+    } catch {}
+
+    // 2. Extract params from body
+    let bodyParams: Record<string, any> = {};
+    if (typeof req.body === 'object' && req.body !== null) {
+      bodyParams = req.body;
+    } else if (typeof req.body === 'string') {
+      try {
+        bodyParams = JSON.parse(req.body);
+      } catch {
+        const searchParams = new URLSearchParams(req.body);
+        searchParams.forEach((val, key) => { bodyParams[key] = val; });
+      }
+    }
+
+    // Helper to search value across all param sources (case-insensitive keys)
+    const getValue = (keys: string[]): string | undefined => {
+      for (const k of keys) {
+        for (const source of [urlParamsObj, req.query, bodyParams]) {
+          if (!source) continue;
+          for (const [sKey, sVal] of Object.entries(source)) {
+            if (sKey.toLowerCase() === k.toLowerCase() && sVal !== undefined && sVal !== null && String(sVal).trim() !== '') {
+              return String(sVal).trim();
+            }
+          }
+        }
+      }
+      return undefined;
+    };
+
+    const parseNum = (valStr?: string): number => {
+      if (!valStr) return NaN;
+      // Handle commas in Spanish decimal format e.g. "10,245523" -> "10.245523"
+      const clean = String(valStr).replace(',', '.');
+      return parseFloat(clean);
+    };
+
+    const rawDeviceId = getValue(['id', 'deviceid', 'deviceId', 'device_id', 'user', 'username']) || 'Víctor';
+    const latStr = getValue(['lat', 'latitude', 'location_lat']);
+    const lonStr = getValue(['lon', 'lng', 'longitude', 'location_lng']);
+    const speedStr = getValue(['speed', 'spd']);
+    const bearingStr = getValue(['bearing', 'heading', 'hdg']);
+
+    const lat = parseNum(latStr);
+    const lng = parseNum(lonStr);
+    const speed = parseNum(speedStr) || 0;
+    const bearing = parseNum(bearingStr) || 0;
+
+    // If no coordinates provided in heartbeat, log & confirm server availability with HTTP 200
+    if (isNaN(lat) || isNaN(lng)) {
+      console.log('[TRACCAR GPS HEARTBEAT] Handshake ping received:', { rawDeviceId, url: req.originalUrl });
+      res.status(200).send('OK');
+      return;
+    }
+
+    // Accent-insensitive normalization (e.g. "Víctor" -> "victor")
+    const norm = (str: string) =>
+      str ? str.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim() : '';
+
+    const cleanDeviceId = norm(rawDeviceId);
+
+    // Fetch all users to match driver by name or username or ID
+    const allUsers = await prisma.user.findMany();
+    let driver = allUsers.find(u => {
+      const uName = norm(u.name || '');
+      const uUser = norm(u.username || '');
+      const uId = norm(u.id || '');
+      return (
+        (uName && (uName === cleanDeviceId || uName.includes(cleanDeviceId) || cleanDeviceId.includes(uName))) ||
+        (uUser && (uUser === cleanDeviceId || uUser.includes(cleanDeviceId) || cleanDeviceId.includes(uUser))) ||
+        (uId && uId === cleanDeviceId)
+      );
+    });
+
+    // Fallback 1: user with role 'delivery'
+    if (!driver) {
+      driver = allUsers.find(u => u.role === 'delivery');
+    }
+
+    // Fallback 2: first user in database
+    if (!driver) {
+      driver = allUsers[0];
+    }
+
+    if (driver) {
+      // 1. Parse incoming timestamp
+      const timestampStr = getValue(['timestamp', 'time', 'deviceTime', 'fixTime']);
+      let fixTime = new Date();
+      if (timestampStr) {
+        if (/^\d+$/.test(timestampStr)) {
+          const num = parseInt(timestampStr, 10);
+          if (num < 10000000000) {
+            fixTime = new Date(num * 1000);
+          } else {
+            fixTime = new Date(num);
+          }
+        } else {
+          const parsed = Date.parse(timestampStr);
+          if (!isNaN(parsed)) {
+            fixTime = new Date(parsed);
+          } else {
+            const match = timestampStr.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+            if (match) {
+              const [_, y, m, d, h, min, s] = match;
+              fixTime = new Date(Date.UTC(
+                parseInt(y, 10),
+                parseInt(m, 10) - 1,
+                parseInt(d, 10),
+                parseInt(h, 10),
+                parseInt(min, 10),
+                parseInt(s, 10)
+              ));
+            }
+          }
+        }
+      }
+
+      // 2. Out-of-order queue protection: check if DB already has a newer location timestamp
+      if (driver.location_updated_at) {
+        const dbTime = new Date(driver.location_updated_at);
+        if (dbTime.getTime() >= fixTime.getTime()) {
+          console.log(`[TRACCAR GPS SKIP] Stale queued position skipped for ${driver.name}. Incoming (${fixTime.toISOString()}) is older/equal to DB (${dbTime.toISOString()})`);
+          res.status(200).send('OK');
+          return;
+        }
+      }
+
+      await prisma.user.update({
+        where: { id: driver.id },
+        data: {
+          location_lat: lat,
+          location_lng: lng,
+          location_updated_at: fixTime,
+        },
+      });
+
+      broadcastEvent('location_update', {
+        driver_id: driver.id,
+        name: driver.name,
+        username: driver.username,
+        color: driver.color || null,
+        photo_url: driver.photo_data_url || null,
+        lat,
+        lng,
+        speed,
+        bearing,
+        updated_at: fixTime.toISOString(),
+      });
+
+      console.log(`[TRACCAR GPS SUCCESS] Position updated for ${driver.name} (${rawDeviceId}): ${lat}, ${lng} at ${fixTime.toISOString()}`);
+    } else {
+      console.warn(`[TRACCAR GPS] Received location for unknown deviceId: ${rawDeviceId}`);
+    }
+
+    res.status(200).send('OK');
+  } catch (err: any) {
+    console.error('Error in Traccar handler:', err);
+    res.status(200).send('OK');
+  }
+};
+
+app.get('/api/traccar', handleTraccarPing);
+app.post('/api/traccar', handleTraccarPing);
+
+app.get('/api/delivery/locations', requireRoles('admin', 'vendedor', 'delivery'), async (req: Request, res: Response) => {
+  try {
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
     const active = await prisma.user.findMany({
       where: {
-        role: 'delivery',
         location_lat: { not: null },
         location_lng: { not: null },
+        location_updated_at: { gte: fiveMinutesAgo },
       },
     });
     const result = active.map((u) => ({
       delivery_id: u.id,
-      name: u.name,
+      name: u.name || u.username,
+      username: u.username,
       photo_url: u.photo_data_url || null,
+      color: u.color || null,
       lat: u.location_lat!,
       lng: u.location_lng!,
       updated_at: u.location_updated_at ? u.location_updated_at.toISOString() : new Date().toISOString(),
@@ -2526,6 +3457,14 @@ app.post('/api/push/unsubscribe', authMiddleware, async (req: AuthRequest, res: 
   } catch (err: any) {
     console.error('Error unsubscribing push:', err);
     res.status(500).json({ detail: 'Error al desuscribir notificaciones push' });
+  }
+});
+
+// ── GLOBAL ERROR HANDLING MIDDLEWARE ──
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  console.error('[Global Error Handler]:', err?.stack || err);
+  if (!res.headersSent) {
+    res.status(500).json({ detail: 'Error interno del servidor. Por favor, intente de nuevo más tarde.' });
   }
 });
 
